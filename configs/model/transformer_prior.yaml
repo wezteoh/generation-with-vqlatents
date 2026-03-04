@@ -1,0 +1,33 @@
+# Unconditional prior over VQ codebook indices (use after training VQ-VAE).
+# vq_ckpt_path must point to a trained VQ-VAE checkpoint (e.g. checkpoints/<run_id>/vqvae-*.ckpt).
+name: transformer_prior
+
+vq_ckpt_path: ./checkpoints/ct3png0p/last.ckpt  # set via override or env, e.g. checkpoints/xyz/vqvae-last.ckpt
+
+n_embed: 16
+embed_dim: 16
+image_key: image
+
+# Causal transformer
+block_size: 16
+n_layer: 3
+n_head: 2
+n_embd: 32
+transformer_dropout: 0.0
+
+# Training
+learning_rate: 0.0001
+pkeep: 1.0
+sos_token: 0
+
+# Sampling defaults (for inference)
+temperature: 1.0
+top_k: 16
+
+val_logging:
+  enabled: true
+  num_samples: 8
+  log_every_n_val_epochs: 2
+
+  # VQ architecture (ddconfig, n_embed, embed_dim) is read from
+  # config.yaml alongside model.vq_ckpt_path; no need to duplicate it here.
