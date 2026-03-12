@@ -3,7 +3,7 @@ This project involves developing Machine Learning models using Python. The agent
 ## Environment and Stack
 *   **Language:** Python 3.12+.
 *   **Frameworks:** Use `PyTorch` and `PyTorch Lightning` primarily, with `Hydra` to manage config.
-*   **Dependency Management:** Use `conda` for dependency management. By default, use the `py312` conda environment pre-created, or create it if it does not exist. Ensure `requirements.txt` is updated with required packages.
+*   **Dependency Management:** Use `uv` for dependency management. Ensure `pyproject.toml` is updated with required packages.
 
 ## Code Style
 *   **Linting:** Adhere to `flake8` and `black` style guidelines.
@@ -23,7 +23,7 @@ This project involves developing Machine Learning models using Python. The agent
         |- modules: nn.module model or model components
         |- utils
         |- interfaces: high level lightning module classes which correspond to training task types (e.g. ImageGenVQVAE). It usally has a `model` attribute that defines the main model for the task and methods that govern the training for that task.
-    |- configs
+    |- configs: high level task based main configs e.g. train_{MODEL}_{DATA}_v1.yaml config, with model and data subconfigs. Trainer related stuff in main config only under trainer section.
     |- train.py
     ```
-*   **Testing:** When conduct testing which require artifact checking, save all artifacts in `tmp` directory. Try to be efficient when testing training script (use small subset of data).
+*   **Testing:** First, activate the venv by running source .venv/bin/activate from the repository root. When conduct testing which require artifact checking, save all artifacts in `tmp` directory. Try to be efficient when testing training script (use small subset of data).

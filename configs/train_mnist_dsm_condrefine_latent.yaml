@@ -1,0 +1,45 @@
+defaults:
+  - data: mnist
+  - model: dsm_condrefine_latent
+  - _self_
+
+seed: 42
+
+hardware:
+  use_gpu: true
+  gpu_devices: 1
+
+wandb:
+  enabled: true
+  project: dsm-prior-training
+  entity: null
+  name: null
+  save_dir: ./wandb
+  log_model: false
+
+trainer:
+  lightning:
+    max_epochs: 30
+    accelerator: auto
+    devices: 1
+    precision: 32
+    log_every_n_steps: 20
+    check_val_every_n_epoch: null
+    val_check_interval: 400
+    deterministic: false
+    fast_dev_run: false
+
+  optim:
+    learning_rate: 0.001
+
+  val_logging:
+    enabled: true
+    num_samples: 8
+    n_steps_each_sigma: 100
+    log_every_n_val_epochs: 2
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+

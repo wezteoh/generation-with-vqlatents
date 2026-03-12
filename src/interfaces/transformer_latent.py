@@ -1,5 +1,6 @@
 """Lightning interface for training the unconditional prior over VQ latent indices."""
 
+import math
 from typing import Any, Optional
 
 import pytorch_lightning as pl
@@ -7,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.optim.lr_scheduler import LambdaLR
 
 from src.modules.autoencoders import VQAutoencoder
 from src.modules.latents import LatentTransformer
@@ -32,15 +34,13 @@ def _load_vq_from_ckpt(
     # If checkpoint is from VQVAEInterface, weights live under "model."
     if any(k.startswith("model.") for k in state_dict):
         state_dict = {
-            k.replace("model.", ""): v
-            for k, v in state_dict.items()
-            if k.startswith("model.")
+            k.replace("model.", ""): v for k, v in state_dict.items() if k.startswith("model.")
         }
     vq.load_state_dict(state_dict, strict=True)
     return vq
 
 
-class TransformerPriorInterface(pl.LightningModule):
+class TransformerLatentInterface(pl.LightningModule):
     """Train unconditional prior on image batches with a pretrained VQ checkpoint."""
 
     def __init__(
@@ -55,6 +55,8 @@ class TransformerPriorInterface(pl.LightningModule):
         n_embd: int,
         image_key: str = "image",
         learning_rate: float = 1e-4,
+        betas: tuple[float, float] = (0.9, 0.95),
+        scheduler: dict[str, Any] | None = None,
         pkeep: float = 1.0,
         sos_token: int = 0,
         transformer_dropout: float = 0.0,
@@ -64,6 +66,12 @@ class TransformerPriorInterface(pl.LightningModule):
         self.save_hyperparameters()
         self.image_key = image_key
         self.learning_rate = learning_rate
+        self.betas = betas
+        self.scheduler_cfg = scheduler or {
+            "name": "warmup_cosine",
+            "warmup_steps": 500,
+            "min_lr_ratio": 0.1,
+        }
         # Validation image logging: interpret log_every_n_val_epochs as
         # "log every N validation passes" (not training epochs).
         self._val_pass_count = 0
@@ -141,17 +149,13 @@ class TransformerPriorInterface(pl.LightningModule):
         enabled = self.val_logging_cfg.get("enabled", True)
         num_samples = int(self.val_logging_cfg.get("num_samples", 8))
         log_every_n = int(self.val_logging_cfg.get("log_every_n_val_epochs", 1))
-        if (
-            not enabled
-            or batch_idx != 0
-            or log_every_n <= 0
-            or self.logger is None
-        ):
+        if not enabled or batch_idx != 0 or log_every_n <= 0 or self.logger is None:
             return
         # We are at batch_idx == 0 of a real validation pass; gate on pass count.
         if self._val_pass_count % log_every_n != 0:
             return
         from pytorch_lightning.loggers import WandbLogger
+
         import wandb
 
         if not isinstance(self.logger, WandbLogger):
@@ -160,9 +164,7 @@ class TransformerPriorInterface(pl.LightningModule):
         x = self.model.get_input(self.image_key, batch)
         n = min(num_samples, x.shape[0])
         _, z_indices = self.model.encode_to_z(x[:n])
-        z_shape = (n,) + tuple(
-            self.model.first_stage_model.encode(x[:1])[0].shape[1:]
-        )
+        z_shape = (n,) + tuple(self.model.first_stage_model.encode(x[:1])[0].shape[1:])
 
         vocab_size = self.model.transformer.config.vocab_size
         safe_top_k = min(100, vocab_size)
@@ -181,9 +183,9 @@ class TransformerPriorInterface(pl.LightningModule):
         if orig.shape[-1] == 1:
             orig = orig.repeat(1, 1, 1, 3)
             gen = gen.repeat(1, 1, 1, 3)
-        images = [
-            wandb.Image(orig[i].numpy(), caption=f"input {i}") for i in range(n)
-        ] + [wandb.Image(gen[i].numpy(), caption=f"sample {i}") for i in range(n)]
+        images = [wandb.Image(orig[i].numpy(), caption=f"input {i}") for i in range(n)] + [
+            wandb.Image(gen[i].numpy(), caption=f"sample {i}") for i in range(n)
+        ]
         self.logger.experiment.log(
             {"val/prior_samples": images},
             step=self.global_step,
@@ -215,6 +217,36 @@ class TransformerPriorInterface(pl.LightningModule):
                 "weight_decay": 0.0,
             },
         ]
-        return torch.optim.AdamW(
-            optim_groups, lr=self.learning_rate, betas=(0.9, 0.95)
-        )
+
+        optimizer = torch.optim.AdamW(optim_groups, lr=self.learning_rate, betas=self.betas)
+
+        if self.scheduler_cfg.get("name", "warmup_cosine") != "warmup_cosine":
+            return optimizer
+
+        warmup_steps = int(self.scheduler_cfg.get("warmup_steps", 500))
+        min_lr_ratio = float(self.scheduler_cfg.get("min_lr_ratio", 0.1))
+
+        def lr_lambda(current_step: int) -> float:
+            total_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0))
+            if total_steps <= 0:
+                return 1.0
+
+            capped_warmup = min(warmup_steps, total_steps)
+            if current_step < capped_warmup:
+                return float(current_step + 1) / float(capped_warmup)
+
+            progress = (current_step - capped_warmup) / float(total_steps - capped_warmup)
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+        lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": lr_scheduler,
+                "interval": self.scheduler_cfg.get("interval", "step"),
+                "frequency": 1,
+                "name": "lr",
+            },
+        }

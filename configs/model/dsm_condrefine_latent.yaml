@@ -1,0 +1,20 @@
+name: dsm_latent
+
+# CondRefineNet over VQ latents (same hyperparams as dsm_unet_latent).
+base_channels: 16
+
+# Sigma schedule for annealed DSM (exponential between max and min).
+min_sigma: 0.01
+max_sigma: 1.0
+num_sigmas: 10
+
+anneal_power: 2.0
+use_annealed_loss: true
+
+# VQ-VAE checkpoint used as first-stage autoencoder.
+# Must point to a checkpoint produced by VQVAEInterface.
+vq_ckpt_path: ./checkpoints/ct3png0p/last.ckpt
+
+# Use CondRefineNet backbone instead of UNet.
+score_backbone: cond_refinenet
+
