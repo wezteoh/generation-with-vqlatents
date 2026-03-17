@@ -13,3 +13,7 @@ use_annealed_loss: true
 
 # CondRefineNet backbone.
 score_backbone: cond_refinenet
+
+# Exponential moving average (EMA) over the score network parameters.
+use_ema: true
+ema_decay: 0.999

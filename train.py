@@ -142,6 +142,8 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
         max_sigma = float(model_cfg.get("max_sigma", 0.2))
         num_sigmas = int(model_cfg.get("num_sigmas", 4))
         score_backbone = str(model_cfg.get("score_backbone", "unet"))
+        use_ema = bool(model_cfg.get("use_ema", True))
+        ema_decay = float(model_cfg.get("ema_decay", 0.999))
 
         return DSMLatentInterface(
             ddconfig=vq_ddconfig,
@@ -158,6 +160,8 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             use_annealed_loss=bool(model_cfg.get("use_annealed_loss", True)),
             val_logging=trainer_val_logging,
             score_backbone=score_backbone,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
         )
 
     if model_name == "dsm_raw":
@@ -170,6 +174,8 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
         max_sigma = float(model_cfg.get("max_sigma", 0.2))
         num_sigmas = int(model_cfg.get("num_sigmas", 4))
         score_backbone = str(model_cfg.get("score_backbone", "unet"))
+        use_ema = bool(model_cfg.get("use_ema", True))
+        ema_decay = float(model_cfg.get("ema_decay", 0.999))
 
         return DSMRawInterface(
             in_channels=in_channels,
@@ -184,6 +190,8 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             use_annealed_loss=bool(model_cfg.get("use_annealed_loss", True)),
             val_logging=trainer_val_logging,
             score_backbone=score_backbone,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
         )
 
     raise ValueError(f"Unknown model name: {model_name}")

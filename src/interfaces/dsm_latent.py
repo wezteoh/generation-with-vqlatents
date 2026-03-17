@@ -6,8 +6,10 @@ import pytorch_lightning as pl
 import torch
 
 from src.interfaces.transformer_latent import _load_vq_from_ckpt
+from src.modules.ema import LitEma
 from src.modules.latents.score_models import ScoreModel
 from src.modules.latents.score_models.cond_refinednet import LatentCondRefineNetScore
+from src.modules.latents.score_models.ncsnv2 import LatentNCSNv2Score
 from src.modules.latents.score_models.unet import LatentUNetScore
 from src.modules.losses.score_matching import anneal_dsm_loss, dsm_loss
 
@@ -31,6 +33,8 @@ class DSMLatentInterface(pl.LightningModule):
         use_annealed_loss: bool = True,
         val_logging: Optional[dict[str, Any]] = None,
         score_backbone: str = "unet",
+        use_ema: bool = False,
+        ema_decay: float = 0.999,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -47,6 +51,9 @@ class DSMLatentInterface(pl.LightningModule):
             "n_steps_each": 20,
             "step_lr": 2e-5,
         }
+
+        self.use_ema = bool(use_ema)
+        self.ema_decay = float(ema_decay)
 
         # Exponential schedule between max_sigma (largest noise) and min_sigma (smallest),
         # with sigmas[0] = max_sigma and sigmas[-1] = min_sigma.
@@ -92,10 +99,28 @@ class DSMLatentInterface(pl.LightningModule):
                 image_size=int(latent_res),
                 logit_transform=False,
             )
+        elif score_backbone == "ncsnv2":
+            backbone = LatentNCSNv2Score(
+                in_channels=embed_dim,
+                base_channels=base_channels,
+                num_classes=int(num_sigmas),
+                first_stage_model=first_stage,
+                image_size=int(latent_res),
+                logit_transform=False,
+                sigmas=self.sigmas,
+            )
         else:
             raise ValueError(f"Unsupported score_backbone for DSM latent: {score_backbone}")
 
         self.model = backbone
+
+        # Optional EMA wrapper around the score model.
+        if self.use_ema:
+            if not (0.0 < self.ema_decay <= 1.0):
+                raise ValueError(f"EMA decay must be in (0, 1], got {self.ema_decay}")
+            self.ema = LitEma(self.model, decay=self.ema_decay)
+        else:
+            self.ema = None
 
     def forward(self, x: torch.Tensor, sigma_labels: torch.Tensor) -> torch.Tensor:
         return self.model(x, sigma_labels)
@@ -156,10 +181,33 @@ class DSMLatentInterface(pl.LightningModule):
         if not is_sanity and batch_idx == 0:
             self._val_pass_count += 1
 
+        if self.ema is not None and not is_sanity:
+            self.ema.store(self.model.parameters())
+            self.ema.copy_to(self.model)
+            try:
+                loss = self._shared_step(batch, stage="val")
+                self._maybe_log_val_samples(batch, batch_idx)
+            finally:
+                self.ema.restore(self.model.parameters())
+            return loss
+
         loss = self._shared_step(batch, stage="val")
         if not is_sanity:
             self._maybe_log_val_samples(batch, batch_idx)
         return loss
+
+    def optimizer_step(
+        self,
+        epoch: int,
+        batch_idx: int,
+        optimizer: torch.optim.Optimizer,
+        optimizer_closure,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure, *args, **kwargs)
+        if self.ema is not None:
+            self.ema(self.model)
 
     def configure_optimizers(self) -> Any:
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)

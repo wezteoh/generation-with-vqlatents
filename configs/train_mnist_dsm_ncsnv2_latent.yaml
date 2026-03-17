@@ -1,9 +1,9 @@
 defaults:
-  - data: mnist
-  - model: dsm_condrefine_latent
+  - data: mnist_b128
+  - model: dsm_ncsnv2_latent
   - _self_
 
-seed: 43
+seed: 42
 
 hardware:
   use_gpu: true
@@ -19,23 +19,23 @@ wandb:
 
 trainer:
   lightning:
-    max_epochs: 30
+    max_epochs: 100
     accelerator: auto
     devices: 1
     precision: 32
     log_every_n_steps: 20
     check_val_every_n_epoch: null
-    val_check_interval: 400
+    val_check_interval: 500
     deterministic: false
     fast_dev_run: false
 
   optim:
-    learning_rate: 0.001
+    learning_rate: 0.0001
 
   val_logging:
     enabled: true
     num_samples: 8
-    n_steps_each_sigma: 100
+    n_steps_each_sigma: 5
     log_every_n_val_epochs: 2
 
 hydra:

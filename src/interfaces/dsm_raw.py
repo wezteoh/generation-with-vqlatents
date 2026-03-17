@@ -5,8 +5,10 @@ from typing import Any, Optional
 import pytorch_lightning as pl
 import torch
 
+from src.modules.ema import LitEma
 from src.modules.latents.score_models import ScoreModel
 from src.modules.latents.score_models.cond_refinednet import LatentCondRefineNetScore
+from src.modules.latents.score_models.ncsnv2 import LatentNCSNv2Score
 from src.modules.latents.score_models.unet import LatentUNetScore
 from src.modules.losses.score_matching import anneal_dsm_loss, dsm_loss
 
@@ -28,6 +30,8 @@ class DSMRawInterface(pl.LightningModule):
         use_annealed_loss: bool = True,
         val_logging: Optional[dict[str, Any]] = None,
         score_backbone: str = "unet",
+        use_ema: bool = False,
+        ema_decay: float = 0.999,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -35,6 +39,8 @@ class DSMRawInterface(pl.LightningModule):
         self.learning_rate = learning_rate
         self.anneal_power = anneal_power
         self.use_annealed_loss = use_annealed_loss
+        self.use_ema = bool(use_ema)
+        self.ema_decay = float(ema_decay)
         self._val_pass_count = 0
         self.val_logging_cfg = val_logging or {
             "enabled": True,
@@ -70,10 +76,28 @@ class DSMRawInterface(pl.LightningModule):
                 image_size=int(image_size),
                 logit_transform=False,
             )
+        elif score_backbone == "ncsnv2":
+            backbone = LatentNCSNv2Score(
+                in_channels=in_channels,
+                base_channels=base_channels,
+                num_classes=int(num_sigmas),
+                first_stage_model=None,
+                image_size=int(image_size),
+                logit_transform=False,
+                sigmas=self.sigmas,
+            )
         else:
             raise ValueError(f"Unsupported score_backbone for DSM raw: {score_backbone}")
 
         self.model = backbone
+
+        # Optional EMA wrapper around the score model.
+        if self.use_ema:
+            if not (0.0 < self.ema_decay <= 1.0):
+                raise ValueError(f"EMA decay must be in (0, 1], got {self.ema_decay}")
+            self.ema = LitEma(self.model, decay=self.ema_decay)
+        else:
+            self.ema = None
 
     def forward(self, x: torch.Tensor, sigma_labels: torch.Tensor) -> torch.Tensor:
         return self.model(x, sigma_labels)
@@ -130,10 +154,33 @@ class DSMRawInterface(pl.LightningModule):
         if not is_sanity and batch_idx == 0:
             self._val_pass_count += 1
 
+        if self.ema is not None and not is_sanity:
+            self.ema.store(self.model.parameters())
+            self.ema.copy_to(self.model)
+            try:
+                loss = self._shared_step(batch, stage="val")
+                self._maybe_log_val_samples(batch, batch_idx)
+            finally:
+                self.ema.restore(self.model.parameters())
+            return loss
+
         loss = self._shared_step(batch, stage="val")
         if not is_sanity:
             self._maybe_log_val_samples(batch, batch_idx)
         return loss
+
+    def optimizer_step(
+        self,
+        epoch: int,
+        batch_idx: int,
+        optimizer: torch.optim.Optimizer,
+        optimizer_closure,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure, *args, **kwargs)
+        if self.ema is not None:
+            self.ema(self.model)
 
     def configure_optimizers(self) -> Any:
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -163,7 +210,12 @@ class DSMRawInterface(pl.LightningModule):
         n = min(num_samples, x_img.shape[0])
         x_img = x_img[:n]
         device = x_img.device
-        image_shape = (n, self.hparams.in_channels, self.hparams.image_size, self.hparams.image_size)
+        image_shape = (
+            n,
+            self.hparams.in_channels,
+            self.hparams.image_size,
+            self.hparams.image_size,
+        )
 
         sampled = self.model.sample_latents(
             batch_size=n,

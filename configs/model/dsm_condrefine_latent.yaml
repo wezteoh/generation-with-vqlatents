@@ -18,3 +18,7 @@ vq_ckpt_path: ./checkpoints/ct3png0p/last.ckpt
 # Use CondRefineNet backbone instead of UNet.
 score_backbone: cond_refinenet
 
+# Exponential moving average (EMA) over the score network parameters.
+use_ema: true
+ema_decay: 0.999
+
