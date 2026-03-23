@@ -1,0 +1,17 @@
+name: vqvae
+n_embed: 64
+embed_dim: 8
+image_key: image
+ddconfig:
+  ch: 8
+  out_ch: 1
+  ch_mult: [1, 2, 4]
+  num_res_blocks: 2
+  attn_resolutions: []
+  dropout: 0.0
+  resamp_with_conv: true
+  in_channels: 1
+  resolution: 32
+  z_channels: 8
+  double_z: false
+  num_groups: 8

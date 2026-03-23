@@ -35,10 +35,10 @@ class VQAutoencoder(nn.Module):
             assert isinstance(colorize_nlabels, int)
             self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
 
-    def encode(self, x):
+    def encode(self, x, return_z=False):
         h = self.encoder(x)
         h = self.quant_conv(h)
-        quant, emb_loss, info = self.quantize(h)
+        quant, emb_loss, info = self.quantize(h, return_z=return_z)
         return quant, emb_loss, info
 
     def decode(self, quant):

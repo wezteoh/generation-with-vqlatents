@@ -1,6 +1,6 @@
 defaults:
-  - data: mnist
-  - model: vqvae_2downsampling
+  - data: mnist_b128
+  - model: score_sde_ncsnv2_raw
   - _self_
 
 seed: 42
@@ -11,40 +11,36 @@ hardware:
 
 wandb:
   enabled: true
-  project: vqvae-training
+  project: score-sde-raw-training
   entity: null
-  name: vqvae_mnist_2downsampling_64embed_8dim
+  name: null
   save_dir: ./wandb
   log_model: false
 
 trainer:
   lightning:
-    max_epochs: 20
+    max_epochs: 200
     accelerator: auto
     devices: 1
     precision: 32
     log_every_n_steps: 20
     check_val_every_n_epoch: null
-    val_check_interval: 250
+    val_check_interval: 500
     deterministic: false
     fast_dev_run: false
 
   optim:
-    learning_rate: 0.0002
-    betas: [0.9, 0.95]
-    weight_decay: 0.0
-    scheduler:
-      name: warmup_cosine
-      warmup_steps: 500
-      min_lr_ratio: 0.1
-      interval: step
+    learning_rate: 0.0001
 
   val_logging:
     enabled: true
     num_samples: 8
-    log_every_n_val_epochs: 1
+    log_every_n_val_epochs: 2
+    sample_eps: 1e-3
+    sample_n_steps: null
 
 hydra:
   run:
     dir: .
   output_subdir: null
+

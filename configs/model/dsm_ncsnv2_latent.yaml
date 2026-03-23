@@ -1,11 +1,11 @@
 name: dsm_latent
 
 # NCSNv2-style backbone over VQ latents (mirrors dsm_unet_latent / dsm_condrefine_latent).
-base_channels: 16
+base_channels: 64
 
 # Sigma schedule for annealed DSM (exponential between max and min).
 min_sigma: 0.01
-max_sigma: 25.0
+max_sigma: 5.0
 num_sigmas: 56
 
 anneal_power: 2.0
@@ -13,7 +13,7 @@ use_annealed_loss: true
 
 # VQ-VAE checkpoint used as first-stage autoencoder.
 # Must point to a checkpoint produced by VQVAEInterface.
-vq_ckpt_path: ./checkpoints/ct3png0p/last.ckpt
+vq_ckpt_path: /root/code/generation-with-vqlatents/checkpoints/ct3png0p/last.ckpt
 
 # Use NCSNv2 backbone instead of UNet / CondRefineNet.
 score_backbone: ncsnv2

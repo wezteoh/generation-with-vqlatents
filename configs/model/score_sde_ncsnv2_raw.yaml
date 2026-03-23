@@ -1,0 +1,52 @@
+name: score_sde_raw
+
+# NCSNv2-style backbone over raw images.
+base_channels: 64
+
+# SDE type + parameters (continuous-time training).
+# VE SDE:
+#   x_t = x_0 + sigma(t) * z  (implemented via marginal_prob)
+# VP SDE:
+#   x_t = exp(log_mean_coeff(t)) * x_0 + std(t) * z
+sde_type: vesde
+
+# Number of discretization steps for reverse-time sampling.
+sde_n: 1000
+
+# VE SDE sigma bounds (only used when sde_type == vesde)
+sigma_min: 0.01
+sigma_max: 50.0
+
+# VP SDE beta bounds (only used when sde_type == vpsde)
+# beta_min: 0.1
+# beta_max: 20.0
+
+# If true, sample continuous t in (t_eps, T).
+continuous: true
+
+# Small epsilon to avoid t=0.
+t_eps: 1e-5
+
+# Optional discrete time grid (used only when continuous=false).
+# num_scales: 100
+
+# Whether to weight the score matching loss by the SDE diffusion term.
+likelihood_weighting: true
+
+logit_transform: false
+
+# Exponential moving average (EMA) over the score model parameters.
+use_ema: false
+ema_decay: 0.999
+
+# Reverse-time sampling for validation (`get_sampling_fn` in src/modules/sampling.py).
+# Valid method: pc | ode; predictor/corrector names are registered in sampling.py.
+sampling:
+  sampling:
+    method: pc
+    predictor: none
+    corrector: ald
+    snr: 0.128
+    n_steps_each: 1
+    probability_flow: false
+    noise_removal: false

@@ -13,6 +13,8 @@ from src.data.imagenet import ImageNetDataModule
 from src.data.mnist import MNISTDataModule
 from src.interfaces.dsm_latent import DSMLatentInterface
 from src.interfaces.dsm_raw import DSMRawInterface
+from src.interfaces.score_sde_latent import ScoreSDEInterface
+from src.interfaces.score_sde_raw import ScoreSDERawInterface
 from src.interfaces.transformer_latent import TransformerLatentInterface
 from src.interfaces.vqvae import VQVAEInterface
 
@@ -194,6 +196,89 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             ema_decay=ema_decay,
         )
 
+    if model_name == "score_sde_latent":
+        vq_ckpt = model_cfg.get("vq_ckpt_path")
+        if not vq_ckpt or str(vq_ckpt).lower() == "null":
+            raise ValueError(
+                "Score-SDE requires model.vq_ckpt_path to point to a trained VQ-VAE checkpoint. "
+                "Override with e.g. model.vq_ckpt_path=checkpoints/xyz/vqvae-last.ckpt"
+            )
+
+        ckpt_dir = os.path.dirname(str(vq_ckpt))
+        ckpt_cfg_path = os.path.join(ckpt_dir, "config.yaml")
+        if not os.path.exists(ckpt_cfg_path):
+            raise FileNotFoundError(
+                f"Expected VQ-VAE config at {ckpt_cfg_path}. "
+                "Ensure you saved config.yaml in the checkpoint folder when training VQ-VAE."
+            )
+        ckpt_cfg = OmegaConf.load(ckpt_cfg_path)
+        vq_model_cfg = OmegaConf.to_container(ckpt_cfg.model, resolve=True)
+        vq_ddconfig = dict(vq_model_cfg["ddconfig"])
+        vq_n_embed = int(vq_model_cfg["n_embed"])
+        vq_embed_dim = int(vq_model_cfg["embed_dim"])
+
+        trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
+
+        return ScoreSDEInterface(
+            ddconfig=vq_ddconfig,
+            n_embed=vq_n_embed,
+            embed_dim=vq_embed_dim,
+            vq_ckpt_path=str(vq_ckpt),
+            image_key=image_key,
+            learning_rate=float(trainer_optim["learning_rate"]),
+            # SDE/time options
+            sde_type=str(model_cfg.get("sde_type", "vesde")),
+            sde_n=int(model_cfg.get("sde_n", 1000)),
+            sigma_min=float(model_cfg.get("sigma_min", 0.01)),
+            sigma_max=float(model_cfg.get("sigma_max", 50.0)),
+            beta_min=float(model_cfg.get("beta_min", 0.1)),
+            beta_max=float(model_cfg.get("beta_max", 20.0)),
+            continuous=bool(model_cfg.get("continuous", True)),
+            t_eps=float(model_cfg.get("t_eps", 1e-3)),
+            likelihood_weighting=bool(model_cfg.get("likelihood_weighting", True)),
+            # Model/backbone
+            base_channels=int(model_cfg.get("base_channels", 64)),
+            logit_transform=bool(model_cfg.get("logit_transform", False)),
+            # EMA
+            use_ema=bool(model_cfg.get("use_ema", False)),
+            ema_decay=float(model_cfg.get("ema_decay", 0.999)),
+            val_logging=trainer_val_logging,
+            sampling_cfg=model_cfg.get("sampling"),
+        )
+
+    if model_name == "score_sde_raw":
+        trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
+
+        in_channels = int(cfg.data.in_channels)
+        image_size = int(cfg.data.params.image_size)
+
+        return ScoreSDERawInterface(
+            in_channels=in_channels,
+            image_size=image_size,
+            image_key=image_key,
+            learning_rate=float(trainer_optim["learning_rate"]),
+            # SDE/time options
+            sde_type=str(model_cfg.get("sde_type", "vesde")),
+            sde_n=int(model_cfg.get("sde_n", 1000)),
+            sigma_min=float(model_cfg.get("sigma_min", 0.01)),
+            sigma_max=float(model_cfg.get("sigma_max", 50.0)),
+            beta_min=float(model_cfg.get("beta_min", 0.1)),
+            beta_max=float(model_cfg.get("beta_max", 20.0)),
+            continuous=bool(model_cfg.get("continuous", True)),
+            t_eps=float(model_cfg.get("t_eps", 1e-3)),
+            likelihood_weighting=bool(model_cfg.get("likelihood_weighting", True)),
+            # Model/backbone
+            base_channels=int(model_cfg.get("base_channels", 64)),
+            logit_transform=bool(model_cfg.get("logit_transform", False)),
+            # EMA
+            use_ema=bool(model_cfg.get("use_ema", False)),
+            ema_decay=float(model_cfg.get("ema_decay", 0.999)),
+            val_logging=trainer_val_logging,
+            sampling_cfg=model_cfg.get("sampling"),
+        )
+
     raise ValueError(f"Unknown model name: {model_name}")
 
 
@@ -249,7 +334,7 @@ def _print_model_summary(module: nn.Module) -> None:
 
 
 @hydra.main(
-    config_path="configs", config_name="train_mnist_score_matching_latent", version_base=None
+    config_path="configs", config_name="train_mnist_score_sde_ncsnv2_latent", version_base=None
 )
 def main(cfg: DictConfig) -> None:
     pl.seed_everything(int(cfg.seed), workers=True)
@@ -275,7 +360,13 @@ def main(cfg: DictConfig) -> None:
         logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
 
     model_name = OmegaConf.select(cfg, "model.name", default="vqvae")
-    if model_name in ("transformer_latent", "dsm_latent", "dsm_raw"):
+    if model_name in (
+        "transformer_latent",
+        "dsm_latent",
+        "dsm_raw",
+        "score_sde_latent",
+        "score_sde_raw",
+    ):
         monitor, mode, filename = "val/loss", "min", "latent-{epoch}-{step}"
     else:
         monitor, mode, filename = "val/rec_loss", "min", "vqvae-{epoch}-{step}"

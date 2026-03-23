@@ -70,7 +70,7 @@ class VectorQuantizer(nn.Module):
         back = torch.gather(used[None, :][inds.shape[0] * [0], :], 1, inds)
         return back.reshape(ishape)
 
-    def forward(self, z, temp=None, rescale_logits=False, return_logits=False):
+    def forward(self, z, temp=None, rescale_logits=False, return_logits=False, return_z=False):
         assert temp is None or temp == 1.0, "Only for interface compatible with Gumbel"
         assert rescale_logits == False, "Only for interface compatible with Gumbel"
         assert return_logits == False, "Only for interface compatible with Gumbel"
@@ -117,7 +117,12 @@ class VectorQuantizer(nn.Module):
                 z_q.shape[0], z_q.shape[2], z_q.shape[3]
             )
 
-        return z_q, loss, (perplexity, min_encodings, min_encoding_indices)
+        if return_z:
+            info = (perplexity, min_encodings, min_encoding_indices, z)
+        else:
+            info = (perplexity, min_encodings, min_encoding_indices)
+
+        return z_q, loss, info
 
     def get_codebook_entry(self, indices, shape):
         # shape specifying (batch, height, width, channel)
