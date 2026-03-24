@@ -4,6 +4,7 @@ from typing import Any
 import numpy as np
 import pytorch_lightning as pl
 import torch
+from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -37,6 +38,16 @@ def _build_comparison_images(orig: torch.Tensor, recon: torch.Tensor):
     return images
 
 
+def _tensor_to_fid_input(t: torch.Tensor) -> torch.Tensor:
+    """(B, C, H, W) normalized float -> (B, 3, H, W) uint8 [0, 255] for FID."""
+    t = t.detach().float()
+    t = (t * 0.5 + 0.5).clamp(0.0, 1.0)
+    if t.shape[1] == 1:
+        t = t.repeat(1, 3, 1, 1)
+    t = (t * 255.0).round().to(torch.uint8)
+    return t
+
+
 class VQVAEInterface(pl.LightningModule):
     def __init__(
         self,
@@ -65,7 +76,33 @@ class VQVAEInterface(pl.LightningModule):
             "enabled": True,
             "num_samples": 8,
             "log_every_n_val_epochs": 1,
+            "rfid": {
+                "enabled": False,
+                "feature": 2048,
+                "max_samples": 0,
+            },
         }
+        rfid_cfg = self.val_logging_cfg.get("rfid", {})
+        self.rfid_cfg = {
+            "enabled": bool(rfid_cfg.get("enabled", False)),
+            "feature": int(rfid_cfg.get("feature", 2048)),
+            "max_samples": int(rfid_cfg.get("max_samples", 0)),
+        }
+        self.rfid_metric: nn.Module | None = None
+        self._rfid_num_samples = 0
+        if self.rfid_cfg["enabled"]:
+            try:
+                from torchmetrics.image.fid import FrechetInceptionDistance
+            except Exception as exc:
+                raise ImportError(
+                    "rFID logging requires torchmetrics and torch-fidelity. "
+                    "Install both dependencies to enable trainer.val_logging.rfid.enabled=true."
+                ) from exc
+            self.rfid_metric = FrechetInceptionDistance(
+                feature=self.rfid_cfg["feature"],
+                reset_real_features=True,
+                normalize=False,
+            )
         # Validation image logging: interpret log_every_n_val_epochs as
         # "log every N validation passes" (not training epochs).
         self._val_pass_count = 0
@@ -112,6 +149,7 @@ class VQVAEInterface(pl.LightningModule):
         self.log("val/rec_loss", rec_loss, on_epoch=True)
         self.log("val/emb_loss", emb_loss, on_epoch=True)
         self.log("val/perplexity", perplexity, on_epoch=True)
+        self._update_rfid(x, recon)
 
         enabled = self.val_logging_cfg.get("enabled", True)
         num_samples = int(self.val_logging_cfg.get("num_samples", 8))
@@ -146,6 +184,41 @@ class VQVAEInterface(pl.LightningModule):
             pass
 
         return loss
+
+    def on_validation_epoch_start(self) -> None:
+        if self.rfid_metric is not None:
+            self.rfid_metric.reset()
+            self._rfid_num_samples = 0
+
+    def on_validation_epoch_end(self) -> None:
+        is_sanity = getattr(self.trainer, "sanity_checking", False)
+        if is_sanity or self.rfid_metric is None or self._rfid_num_samples <= 0:
+            return
+
+        rfid = self.rfid_metric.compute()
+        self.log("val/rfid", rfid, on_epoch=True, prog_bar=True, sync_dist=True)
+
+    def _update_rfid(self, x: torch.Tensor, recon: torch.Tensor) -> None:
+        is_sanity = getattr(self.trainer, "sanity_checking", False)
+        if is_sanity or self.rfid_metric is None:
+            return
+
+        max_samples = self.rfid_cfg["max_samples"]
+        if max_samples > 0:
+            remaining = max_samples - self._rfid_num_samples
+            if remaining <= 0:
+                return
+            n = min(int(x.shape[0]), remaining)
+            x = x[:n]
+            recon = recon[:n]
+        else:
+            n = int(x.shape[0])
+
+        real = _tensor_to_fid_input(x)
+        fake = _tensor_to_fid_input(recon)
+        self.rfid_metric.update(real, real=True)
+        self.rfid_metric.update(fake, real=False)
+        self._rfid_num_samples += n
 
     def configure_optimizers(self) -> Any:
         optimizer = AdamW(

@@ -13,6 +13,8 @@ dependencies = [
   "wandb==0.25.0",
   "tqdm==4.67.1",
   "pytorch-lightning==2.5.3",
+  "torchmetrics==1.8.2",
+  "torch-fidelity==0.4.0",
   "einops==0.8.1",
   "scipy==1.13.1",
   "imageio==2.37.0",

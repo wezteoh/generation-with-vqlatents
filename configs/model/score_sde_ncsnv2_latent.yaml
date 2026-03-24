@@ -32,7 +32,7 @@ t_eps: 1e-5
 likelihood_weighting: true
 
 # VQ-VAE checkpoint used as first-stage autoencoder.
-vq_ckpt_path: /root/code/generation-with-vqlatents/checkpoints/5sg7m1ij/last.ckpt
+vq_ckpt_path: /root/code/generation-with-vqlatents/checkpoints/lbiwfopi/last.ckpt
 
 # NCSNv2 forward uses this scaling switch.
 logit_transform: false

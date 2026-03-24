@@ -1,17 +1,17 @@
 name: vqvae
-n_embed: 256
+n_embed: 8192
 embed_dim: 3
 image_key: image
 ddconfig:
-  ch: 16
-  out_ch: 1
+  ch: 128
+  out_ch: 3
   ch_mult: [1, 2, 4]
   num_res_blocks: 2
   attn_resolutions: []
   dropout: 0.0
   resamp_with_conv: true
-  in_channels: 1
-  resolution: 32
+  in_channels: 3
+  resolution: 256
   z_channels: 3
   double_z: false
-  num_groups: 8
+  num_groups: 32

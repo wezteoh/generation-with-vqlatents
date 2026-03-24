@@ -9,6 +9,7 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
+from src.data.celebahq import CelebAHQ256DataModule
 from src.data.imagenet import ImageNetDataModule
 from src.data.mnist import MNISTDataModule
 from src.interfaces.dsm_latent import DSMLatentInterface
@@ -25,6 +26,8 @@ def _build_datamodule(data_cfg: DictConfig) -> Any:
         return MNISTDataModule(**params)
     if data_cfg.name == "imagenet":
         return ImageNetDataModule(**params)
+    if data_cfg.name == "celebahq256":
+        return CelebAHQ256DataModule(**params)
     raise ValueError(f"Unsupported dataset: {data_cfg.name}")
 
 
@@ -333,6 +336,26 @@ def _print_model_summary(module: nn.Module) -> None:
     print(f"Approx parameter size (fp32): {total_param_size_mb:.2f} MB\n")
 
 
+def _save_checkpoint_dir_config(cfg: DictConfig, ckpt_dir: str) -> None:
+    """Write resolved Hydra config next to checkpoints for later reinstantiation."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    config_path = os.path.join(ckpt_dir, "config.yaml")
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(OmegaConf.to_yaml(cfg, resolve=True))
+
+
+def _resolve_vqvae_checkpoint_monitor(cfg: DictConfig) -> tuple[str, str]:
+    """Return (monitor_key, filename_metric_token) for VQ-VAE checkpointing."""
+    raw = str(OmegaConf.select(cfg, "trainer.checkpoint.monitor_metric", default="rec_loss")).lower()
+    if raw == "rec_loss":
+        return "val/rec_loss", "val_rec_loss"
+    if raw == "rfid":
+        return "val/rfid", "val_rfid"
+    raise ValueError(
+        "trainer.checkpoint.monitor_metric must be one of: rec_loss, rfid"
+    )
+
+
 @hydra.main(
     config_path="configs", config_name="train_mnist_score_sde_ncsnv2_latent", version_base=None
 )
@@ -369,7 +392,9 @@ def main(cfg: DictConfig) -> None:
     ):
         monitor, mode, filename = "val/loss", "min", "latent-{epoch}-{step}"
     else:
-        monitor, mode, filename = "val/rec_loss", "min", "vqvae-{epoch}-{step}"
+        monitor, metric_token = _resolve_vqvae_checkpoint_monitor(cfg)
+        mode = "min"
+        filename = f"vqvae-{{epoch}}-{{step}}-{metric_token}={{{metric_token}:.4f}}"
     callbacks = [
         ModelCheckpoint(
             dirpath=os.path.join("checkpoints", checkpoint_subdir),
@@ -382,6 +407,9 @@ def main(cfg: DictConfig) -> None:
     ]
     if cfg.wandb.enabled:
         callbacks.append(LearningRateMonitor(logging_interval="step"))
+
+    ckpt_dir = os.path.join("checkpoints", checkpoint_subdir)
+    _save_checkpoint_dir_config(cfg, ckpt_dir)
 
     trainer = pl.Trainer(logger=logger, callbacks=callbacks, **trainer_kwargs)
     _print_model_summary(module)
