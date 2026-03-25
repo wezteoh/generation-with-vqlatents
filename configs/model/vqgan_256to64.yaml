@@ -1,0 +1,33 @@
+name: vqgan
+n_embed: 8192
+embed_dim: 3
+image_key: image
+
+# Autoencoder backbone (same as VQ-VAE for 256 -> 64 latents).
+ddconfig:
+  ch: 128
+  out_ch: 3
+  ch_mult: [1, 2, 4]
+  num_res_blocks: 2
+  attn_resolutions: []
+  dropout: 0.0
+  resamp_with_conv: true
+  in_channels: 3
+  resolution: 256
+  z_channels: 3
+  double_z: false
+  num_groups: 32
+
+# PatchGAN discriminator.
+disc_config:
+  in_channels: 3
+  n_layers: 3
+  use_actnorm: false
+  ndf: 64
+
+# GAN/loss weights.
+disc_start: 11
+perceptual_weight: 1.0
+discriminator_weight: 0.75
+codebook_weight: 1.0
+gan_loss: hinge

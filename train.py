@@ -17,6 +17,7 @@ from src.interfaces.dsm_raw import DSMRawInterface
 from src.interfaces.score_sde_latent import ScoreSDEInterface
 from src.interfaces.score_sde_raw import ScoreSDERawInterface
 from src.interfaces.transformer_latent import TransformerLatentInterface
+from src.interfaces.vqgan import VQGANInterface
 from src.interfaces.vqvae import VQVAEInterface
 
 
@@ -54,6 +55,41 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             weight_decay=float(trainer_optim["weight_decay"]),
             scheduler=trainer_optim.get("scheduler", {}),
             val_logging=trainer_val_logging,
+        )
+
+    if model_name == "vqgan":
+        trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
+
+        ddconfig = dict(model_cfg["ddconfig"])
+        ddconfig["in_channels"] = int(cfg.data.in_channels)
+        ddconfig["out_ch"] = int(cfg.data.out_channels)
+        ddconfig["resolution"] = int(cfg.data.params.image_size)
+
+        disc_config = dict(model_cfg["disc_config"])
+        disc_config["in_channels"] = int(cfg.data.out_channels)
+
+        return VQGANInterface(
+            ddconfig=ddconfig,
+            disc_config=disc_config,
+            disc_start=int(model_cfg.get("disc_start", 0)),
+            perceptual_weight=float(model_cfg.get("perceptual_weight", 1.0)),
+            discriminator_weight=float(model_cfg.get("discriminator_weight", 1.0)),
+            codebook_weight=float(model_cfg.get("codebook_weight", 1.0)),
+            n_embed=int(model_cfg["n_embed"]),
+            embed_dim=int(model_cfg["embed_dim"]),
+            image_key=image_key,
+            learning_rate=float(trainer_optim["learning_rate"]),
+            disc_learning_rate=(
+                float(trainer_optim["disc_learning_rate"])
+                if "disc_learning_rate" in trainer_optim
+                else None
+            ),
+            betas=tuple(trainer_optim["betas"]),
+            weight_decay=float(trainer_optim["weight_decay"]),
+            scheduler=trainer_optim.get("scheduler", {}),
+            val_logging=trainer_val_logging,
+            gan_loss=str(model_cfg.get("gan_loss", "hinge")),
         )
 
     if model_name == "transformer_prior":
@@ -391,10 +427,14 @@ def main(cfg: DictConfig) -> None:
         "score_sde_raw",
     ):
         monitor, mode, filename = "val/loss", "min", "latent-{epoch}-{step}"
+        ckpt_auto_insert_metric_name = True
     else:
         monitor, metric_token = _resolve_vqvae_checkpoint_monitor(cfg)
         mode = "min"
-        filename = f"vqvae-{{epoch}}-{{step}}-{metric_token}={{{metric_token}:.4f}}"
+        # Brace key must match logged metric name (val/rfid); token before "=" is a safe label.
+        prefix = "vqgan" if model_name == "vqgan" else "vqvae"
+        filename = f"{prefix}-epoch={{epoch}}-step={{step}}-{metric_token}={{{monitor}:.4f}}"
+        ckpt_auto_insert_metric_name = False
     callbacks = [
         ModelCheckpoint(
             dirpath=os.path.join("checkpoints", checkpoint_subdir),
@@ -403,6 +443,7 @@ def main(cfg: DictConfig) -> None:
             save_top_k=2,
             save_last=True,
             filename=filename,
+            auto_insert_metric_name=ckpt_auto_insert_metric_name,
         )
     ]
     if cfg.wandb.enabled:
