@@ -14,6 +14,7 @@ from src.modules.losses.gan import adopt_weight, hinge_d_loss, vanilla_d_loss
 from src.modules.losses.perceptual import perceptual_loss
 from src.modules.losses.vae import reconstruction_loss
 from src.modules.perceptual import LPIPS
+from src.utils.fid_inputs import tensor_to_fid_input
 
 
 def _tensor_to_display(t: torch.Tensor) -> torch.Tensor:
@@ -40,16 +41,6 @@ def _build_comparison_images(orig: torch.Tensor, recon: torch.Tensor):
         combined = np.concatenate([left, right], axis=1)
         images.append(wandb.Image(combined, caption=f"orig | recon {i}"))
     return images
-
-
-def _tensor_to_fid_input(t: torch.Tensor) -> torch.Tensor:
-    """(B, C, H, W) normalized float -> (B, 3, H, W) uint8 [0, 255] for FID."""
-    t = t.detach().float()
-    t = (t * 0.5 + 0.5).clamp(0.0, 1.0)
-    if t.shape[1] == 1:
-        t = t.repeat(1, 3, 1, 1)
-    t = (t * 255.0).round().to(torch.uint8)
-    return t
 
 
 class VQGANInterface(pl.LightningModule):
@@ -347,8 +338,8 @@ class VQGANInterface(pl.LightningModule):
         else:
             n = int(x.shape[0])
 
-        real = _tensor_to_fid_input(x)
-        fake = _tensor_to_fid_input(recon)
+        real = tensor_to_fid_input(x)
+        fake = tensor_to_fid_input(recon)
         self.rfid_metric.update(real, real=True)
         self.rfid_metric.update(fake, real=False)
         self._rfid_num_samples += n

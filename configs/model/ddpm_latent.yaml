@@ -1,0 +1,33 @@
+# DDPM on VQ latents (requires a trained VQ-VAE checkpoint).
+# Override model.vq_ckpt_path to a checkpoint directory that contains last.ckpt and config.yaml.
+name: ddpm_latent
+
+vq_ckpt_path: null
+
+n_embed: 256
+embed_dim: 3
+
+image_key: image
+
+timesteps: 1000
+beta_schedule: linear
+linear_start: 1.0e-4
+linear_end: 2.0e-2
+cosine_s: 8.0e-3
+
+parameterization: eps
+loss_type: l2
+l_simple_weight: 1.0
+original_elbo_weight: 0.0
+
+base_channels: 64
+num_res_blocks: 2
+attention_resolutions: null
+channel_mult: [1, 2, 4]
+dropout: 0.0
+logit_transform: true
+
+use_ema: true
+ema_decay: 0.999
+
+sampling: null

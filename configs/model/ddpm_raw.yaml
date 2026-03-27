@@ -1,0 +1,27 @@
+# DDPM on raw pixels (no VQ). in_channels and image_size come from data config.
+name: ddpm_raw
+
+timesteps: 1000
+beta_schedule: linear
+linear_start: 1.0e-4
+linear_end: 2.0e-2
+cosine_s: 8.0e-3
+
+parameterization: eps
+loss_type: l2
+l_simple_weight: 1.0
+original_elbo_weight: 0.0
+
+base_channels: 32
+num_res_blocks: 2
+attention_resolutions: null
+channel_mult: [1, 2, 4]
+dropout: 0.0
+
+# Data are already in [-1, 1]; do not apply 2*x-1 before the UNet.
+logit_transform: false
+
+use_ema: false
+ema_decay: 0.999
+
+sampling: null

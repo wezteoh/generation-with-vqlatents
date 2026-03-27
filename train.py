@@ -12,6 +12,8 @@ from pytorch_lightning.loggers import WandbLogger
 from src.data.celebahq import CelebAHQ256DataModule
 from src.data.imagenet import ImageNetDataModule
 from src.data.mnist import MNISTDataModule
+from src.interfaces.ddpm_latent import DDPMLatentInterface
+from src.interfaces.ddpm_raw import DDPMRawInterface
 from src.interfaces.dsm_latent import DSMLatentInterface
 from src.interfaces.dsm_raw import DSMRawInterface
 from src.interfaces.score_sde_latent import ScoreSDEInterface
@@ -205,6 +207,119 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             ema_decay=ema_decay,
         )
 
+    if model_name == "ddpm_latent":
+        vq_ckpt = model_cfg.get("vq_ckpt_path")
+        if not vq_ckpt or str(vq_ckpt).lower() == "null":
+            raise ValueError(
+                "DDPM latent requires model.vq_ckpt_path to point to a trained "
+                "VQ-VAE checkpoint. "
+                "Override with e.g. model.vq_ckpt_path=checkpoints/xyz/vqvae-last.ckpt"
+            )
+
+        ckpt_dir = os.path.dirname(str(vq_ckpt))
+        ckpt_cfg_path = os.path.join(ckpt_dir, "config.yaml")
+        if not os.path.exists(ckpt_cfg_path):
+            raise FileNotFoundError(
+                f"Expected VQ-VAE config at {ckpt_cfg_path}. "
+                "Ensure you saved config.yaml in the checkpoint folder when "
+                "training VQ-VAE."
+            )
+        ckpt_cfg = OmegaConf.load(ckpt_cfg_path)
+        vq_model_cfg = OmegaConf.to_container(ckpt_cfg.model, resolve=True)
+        vq_ddconfig = dict(vq_model_cfg["ddconfig"])
+        vq_n_embed = int(vq_model_cfg["n_embed"])
+        vq_embed_dim = int(vq_model_cfg["embed_dim"])
+
+        trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(
+            cfg.trainer.val_logging, resolve=True
+        )
+
+        if "n_embed" in model_cfg and int(model_cfg["n_embed"]) != vq_n_embed:
+            raise ValueError(
+                "ddpm_latent.n_embed does not match VQ-VAE n_embed in "
+                "checkpoint config"
+            )
+        if "embed_dim" in model_cfg and int(model_cfg["embed_dim"]) != vq_embed_dim:
+            raise ValueError(
+                "ddpm_latent.embed_dim does not match VQ-VAE embed_dim in "
+                "checkpoint config"
+            )
+
+        att_res = model_cfg.get("attention_resolutions")
+        if att_res is not None:
+            att_res = tuple(att_res)
+        ch_mult = model_cfg.get("channel_mult", (1, 2, 4, 8))
+        ch_mult = tuple(ch_mult)
+
+        return DDPMLatentInterface(
+            ddconfig=vq_ddconfig,
+            n_embed=vq_n_embed,
+            embed_dim=vq_embed_dim,
+            vq_ckpt_path=str(vq_ckpt),
+            image_key=image_key,
+            learning_rate=float(trainer_optim["learning_rate"]),
+            timesteps=int(model_cfg.get("timesteps", 1000)),
+            beta_schedule=str(model_cfg.get("beta_schedule", "linear")),
+            linear_start=float(model_cfg.get("linear_start", 1e-4)),
+            linear_end=float(model_cfg.get("linear_end", 2e-2)),
+            cosine_s=float(model_cfg.get("cosine_s", 8e-3)),
+            parameterization=str(model_cfg.get("parameterization", "eps")),
+            loss_type=str(model_cfg.get("loss_type", "l2")),
+            l_simple_weight=float(model_cfg.get("l_simple_weight", 1.0)),
+            original_elbo_weight=float(model_cfg.get("original_elbo_weight", 0.0)),
+            base_channels=int(model_cfg.get("base_channels", 64)),
+            num_res_blocks=int(model_cfg.get("num_res_blocks", 2)),
+            attention_resolutions=att_res,
+            channel_mult=ch_mult,
+            dropout=float(model_cfg.get("dropout", 0.0)),
+            logit_transform=bool(model_cfg.get("logit_transform", True)),
+            use_ema=bool(model_cfg.get("use_ema", False)),
+            ema_decay=float(model_cfg.get("ema_decay", 0.999)),
+            val_logging=trainer_val_logging,
+            sampling_cfg=model_cfg.get("sampling"),
+        )
+
+    if model_name == "ddpm_raw":
+        trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(
+            cfg.trainer.val_logging, resolve=True
+        )
+        in_channels = int(cfg.data.in_channels)
+        image_size = int(cfg.data.params.image_size)
+
+        att_res = model_cfg.get("attention_resolutions")
+        if att_res is not None:
+            att_res = tuple(att_res)
+        ch_mult = model_cfg.get("channel_mult", (1, 2, 4, 8))
+        ch_mult = tuple(ch_mult)
+
+        return DDPMRawInterface(
+            in_channels=in_channels,
+            image_size=image_size,
+            image_key=image_key,
+            learning_rate=float(trainer_optim["learning_rate"]),
+            timesteps=int(model_cfg.get("timesteps", 1000)),
+            beta_schedule=str(model_cfg.get("beta_schedule", "linear")),
+            linear_start=float(model_cfg.get("linear_start", 1e-4)),
+            linear_end=float(model_cfg.get("linear_end", 2e-2)),
+            cosine_s=float(model_cfg.get("cosine_s", 8e-3)),
+            parameterization=str(model_cfg.get("parameterization", "eps")),
+            loss_type=str(model_cfg.get("loss_type", "l2")),
+            l_simple_weight=float(model_cfg.get("l_simple_weight", 1.0)),
+            original_elbo_weight=float(model_cfg.get("original_elbo_weight", 0.0)),
+            base_channels=int(model_cfg.get("base_channels", 64)),
+            num_res_blocks=int(model_cfg.get("num_res_blocks", 2)),
+            attention_resolutions=att_res,
+            channel_mult=ch_mult,
+            dropout=float(model_cfg.get("dropout", 0.0)),
+            logit_transform=bool(model_cfg.get("logit_transform", False)),
+            use_ema=bool(model_cfg.get("use_ema", False)),
+            ema_decay=float(model_cfg.get("ema_decay", 0.999)),
+            val_logging=trainer_val_logging,
+            sampling_cfg=model_cfg.get("sampling"),
+        )
+
     if model_name == "dsm_raw":
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
         trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
@@ -343,7 +458,7 @@ def _module_param_count(module: nn.Module) -> int:
 
 def _print_model_tree(
     module: nn.Module,
-    max_depth: int = 3,
+    max_depth: int = 4,
     prefix: str = "",
     depth: int = 0,
     name: str | None = None,
@@ -365,7 +480,7 @@ def _print_model_summary(module: nn.Module) -> None:
     # Approximate fp32 footprint in megabytes.
     total_param_size_mb = (total_params * 4) / (1024**2)
 
-    _print_model_tree(module, max_depth=3)
+    _print_model_tree(module, max_depth=4)
     print("===== Parameter Summary =====")
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Total parameters: {total_params:,}")
@@ -421,6 +536,8 @@ def main(cfg: DictConfig) -> None:
     model_name = OmegaConf.select(cfg, "model.name", default="vqvae")
     if model_name in (
         "transformer_latent",
+        "ddpm_latent",
+        "ddpm_raw",
         "dsm_latent",
         "dsm_raw",
         "score_sde_latent",

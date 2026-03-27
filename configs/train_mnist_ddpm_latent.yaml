@@ -1,0 +1,49 @@
+defaults:
+  - data: mnist
+  - model: ddpm_latent
+  - _self_
+
+seed: 42
+
+hardware:
+  use_gpu: true
+  gpu_devices: 1
+
+wandb:
+  enabled: true
+  project: ddpm-latent-training
+  entity: null
+  name: null
+  save_dir: ./wandb
+  log_model: false
+
+trainer:
+  lightning:
+    max_epochs: 100
+    accelerator: auto
+    devices: 1
+    precision: 32
+    log_every_n_steps: 20
+    check_val_every_n_epoch: null
+    val_check_interval: 500
+    deterministic: false
+    fast_dev_run: false
+
+  optim:
+    learning_rate: 0.0001
+
+  val_logging:
+    enabled: true
+    num_samples: 8
+    log_every_n_val_epochs: 2
+    sample_fid:
+      enabled: false
+      every_n_val_epochs: 5
+      num_real_samples: 512
+      num_gen_samples: 512
+      feature: 2048
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
