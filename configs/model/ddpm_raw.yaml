@@ -24,4 +24,18 @@ logit_transform: false
 use_ema: false
 ema_decay: 0.999
 
+# Optional: classifier-free guidance at sampling (`guidance_scale` > 1 needs `unconditional_prob` > 0 during training).
+# Example:
+# sampling:
+#   clip_denoised: false
+#   guidance_scale: 3.0
+#
+# Optional class/context conditioning:
+# conditioning:
+#   mode: class   # or context or omit / null for unconditional
+#   num_classes: 10
+#   label_key: label
+#   unconditional_prob: 0.1
+# For context mode also set: context_dim, context_key; optional transformer_depth: 1
+
 sampling: null

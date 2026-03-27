@@ -1,6 +1,6 @@
 defaults:
-  - data: mnist
-  - model: ddpm_latent
+  - data: mnist_labeled
+  - model: ddpm_raw
   - _self_
 
 seed: 42
@@ -11,7 +11,7 @@ hardware:
 
 wandb:
   enabled: true
-  project: ddpm-latent-training
+  project: ddpm-raw-cond-training
   entity: null
   name: null
   save_dir: ./wandb
@@ -42,6 +42,17 @@ trainer:
       num_real_samples: 512
       num_gen_samples: 512
       feature: 2048
+
+# Class-conditional DDPM + CFG (overrides defaults from model/ddpm_raw.yaml)
+model:
+  conditioning:
+    mode: class
+    num_classes: 10
+    label_key: label
+    unconditional_prob: 0.1
+  sampling:
+    clip_denoised: false
+    guidance_scale: 3.0
 
 hydra:
   run:

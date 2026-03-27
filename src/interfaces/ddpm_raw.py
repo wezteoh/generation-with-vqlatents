@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 from pytorch_lightning.loggers import WandbLogger
 
 from src.interfaces.ddpm_sample_fid import run_sample_fid_if_gated
 from src.modules.ema import LitEma
 from src.modules.latents.ddpm import RawOpenAIUNetDDPM
+from src.utils.wandb_comparison import build_side_by_side_wandb_images
+
+ConditioningMode = Literal["none", "class", "context"]
 
 
 class DDPMRawInterface(pl.LightningModule):
@@ -40,6 +44,13 @@ class DDPMRawInterface(pl.LightningModule):
         ema_decay: float = 0.999,
         val_logging: Optional[dict[str, Any]] = None,
         sampling_cfg: Optional[dict[str, Any]] = None,
+        conditioning_mode: ConditioningMode = "none",
+        num_data_classes: Optional[int] = None,
+        label_key: str = "label",
+        context_key: str = "context",
+        unconditional_prob: float = 0.0,
+        context_dim: Optional[int] = None,
+        transformer_depth: int = 1,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -49,6 +60,10 @@ class DDPMRawInterface(pl.LightningModule):
         self.loss_type = str(loss_type)
         self.l_simple_weight = float(l_simple_weight)
         self.original_elbo_weight = float(original_elbo_weight)
+        self.conditioning_mode = conditioning_mode
+        self.label_key = str(label_key)
+        self.context_key = str(context_key)
+        self.unconditional_prob = float(unconditional_prob)
 
         self._val_pass_count = 0
         self.val_logging_cfg = val_logging or {
@@ -59,6 +74,7 @@ class DDPMRawInterface(pl.LightningModule):
 
         default_sampling_cfg: dict[str, Any] = {
             "clip_denoised": False,
+            "guidance_scale": 1.0,
         }
         self.sampling_cfg = default_sampling_cfg
         if sampling_cfg is not None:
@@ -67,7 +83,7 @@ class DDPMRawInterface(pl.LightningModule):
         att_res = attention_resolutions
         ch_mult = channel_mult
 
-        self.model = RawOpenAIUNetDDPM(
+        model_kw: dict[str, Any] = dict(
             in_channels=int(in_channels),
             image_size=int(image_size),
             num_timesteps=int(timesteps),
@@ -82,7 +98,23 @@ class DDPMRawInterface(pl.LightningModule):
             channel_mult=ch_mult,
             dropout=float(dropout),
             logit_transform=bool(logit_transform),
+            conditioning_mode=conditioning_mode,
+            transformer_depth=int(transformer_depth),
         )
+        if conditioning_mode == "class":
+            if num_data_classes is None:
+                raise ValueError(
+                    "num_data_classes is required when conditioning_mode is 'class'"
+                )
+            model_kw["num_data_classes"] = int(num_data_classes)
+        elif conditioning_mode == "context":
+            if context_dim is None:
+                raise ValueError(
+                    "context_dim is required when conditioning_mode is 'context'"
+                )
+            model_kw["context_dim"] = int(context_dim)
+
+        self.model = RawOpenAIUNetDDPM(**model_kw)
 
         if bool(use_ema):
             if not (0.0 < float(ema_decay) <= 1.0):
@@ -91,8 +123,14 @@ class DDPMRawInterface(pl.LightningModule):
         else:
             self.ema = None
 
-    def forward(self, x: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        return self.model(x, timesteps=timesteps)
+    def forward(
+        self,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.model(x, timesteps=timesteps, y=y, context=context)
 
     def _get_loss(
         self, pred: torch.Tensor, target: torch.Tensor, mean: bool = True
@@ -117,9 +155,11 @@ class DDPMRawInterface(pl.LightningModule):
         t: torch.Tensor,
         noise: torch.Tensor,
         stage: str,
+        y: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x_noisy = self.model.q_sample(x_start, t, noise)
-        model_out = self(x_noisy, t)
+        model_out = self.model(x_noisy, t, y=y, context=context)
 
         if self.parameterization == "eps":
             target = noise
@@ -173,7 +213,36 @@ class DDPMRawInterface(pl.LightningModule):
         )
         noise = torch.randn_like(x0)
 
-        return self._p_losses(x0, t, noise, stage=stage)
+        if self.conditioning_mode == "none":
+            return self._p_losses(x0, t, noise, stage=stage)
+
+        if self.conditioning_mode == "class":
+            if self.label_key not in batch:
+                raise KeyError(
+                    f"Batch missing label key '{self.label_key}' for class conditioning"
+                )
+            y = batch[self.label_key].long().to(device)
+            if stage == "train" and self.unconditional_prob > 0.0:
+                assert self.model.null_class_index is not None
+                mask = torch.rand(b, device=device) < self.unconditional_prob
+                y = torch.where(
+                    mask,
+                    torch.full_like(y, self.model.null_class_index),
+                    y,
+                )
+            return self._p_losses(x0, t, noise, stage=stage, y=y, context=None)
+
+        if self.context_key not in batch:
+            raise KeyError(
+                f"Batch missing context key {self.context_key!r} (context conditioning)"
+            )
+        ctx_map = batch[self.context_key].to(device)
+        context = rearrange(ctx_map, "b c h w -> b (h w) c")
+        if stage == "train" and self.unconditional_prob > 0.0:
+            mask = torch.rand(b, device=device) < self.unconditional_prob
+            zero = torch.zeros_like(context)
+            context = torch.where(mask.view(b, 1, 1), zero, context)
+        return self._p_losses(x0, t, noise, stage=stage, y=None, context=context)
 
     def training_step(
         self, batch: dict[str, torch.Tensor], batch_idx: int
@@ -217,6 +286,9 @@ class DDPMRawInterface(pl.LightningModule):
                 latent_shape=shape,
                 device=device,
                 clip_denoised=clip,
+                y=None,
+                context=None,
+                guidance_scale=1.0,
             )
 
         run_sample_fid_if_gated(
@@ -270,26 +342,61 @@ class DDPMRawInterface(pl.LightningModule):
         sz = int(self.hparams.image_size)
         image_shape = (n, ic, sz, sz)
         clip = bool(self.sampling_cfg.get("clip_denoised", False))
+        g_scale = float(self.sampling_cfg.get("guidance_scale", 1.0))
 
-        sampled = self.model.sample_latents(
-            batch_size=n,
-            latent_shape=image_shape,
-            device=device,
-            clip_denoised=clip,
-        )
+        if self.conditioning_mode == "none":
+            sampled = self.model.sample_latents(
+                batch_size=n,
+                latent_shape=image_shape,
+                device=device,
+                clip_denoised=clip,
+                y=None,
+                context=None,
+                guidance_scale=1.0,
+            )
+            orig = (x_img.detach().cpu().float() * 0.5 + 0.5).clamp(0, 1)
+            gen = (sampled.detach().cpu().float() * 0.5 + 0.5).clamp(0, 1)
+            orig = (orig.permute(0, 2, 3, 1) * 255).round().to(torch.uint8)
+            gen = (gen.permute(0, 2, 3, 1) * 255).round().to(torch.uint8)
+            if orig.shape[-1] == 1:
+                orig = orig.repeat(1, 1, 1, 3)
+                gen = gen.repeat(1, 1, 1, 3)
+            images = [
+                wandb.Image(orig[i].numpy(), caption=f"input {i}") for i in range(n)
+            ] + [wandb.Image(gen[i].numpy(), caption=f"sample {i}") for i in range(n)]
+            log_key = "val/ddpm_raw_samples"
+        elif self.conditioning_mode == "class":
+            y = batch[self.label_key][:n].long().to(device)
+            sampled = self.model.sample_latents(
+                batch_size=n,
+                latent_shape=image_shape,
+                device=device,
+                clip_denoised=clip,
+                y=y,
+                context=None,
+                guidance_scale=g_scale,
+            )
+            lbl = batch[self.label_key][:n].long().cpu().tolist()
+            captions = [f"real | gen (label {lbl[i]}) [{i}]" for i in range(n)]
+            images = build_side_by_side_wandb_images(x_img, sampled, captions=captions)
+            log_key = "val/ddpm_raw_samples"
+        else:
+            ctx_map = batch[self.context_key][:n].to(device)
+            context = rearrange(ctx_map, "b c h w -> b (h w) c")
+            sampled = self.model.sample_latents(
+                batch_size=n,
+                latent_shape=image_shape,
+                device=device,
+                clip_denoised=clip,
+                y=None,
+                context=context,
+                guidance_scale=g_scale,
+            )
+            captions = [f"real | gen (context) [{i}]" for i in range(n)]
+            images = build_side_by_side_wandb_images(x_img, sampled, captions=captions)
+            log_key = "val/ddpm_raw_samples"
 
-        orig = (x_img.detach().cpu().float() * 0.5 + 0.5).clamp(0, 1)
-        gen = (sampled.detach().cpu().float() * 0.5 + 0.5).clamp(0, 1)
-        orig = (orig.permute(0, 2, 3, 1) * 255).round().to(torch.uint8)
-        gen = (gen.permute(0, 2, 3, 1) * 255).round().to(torch.uint8)
-        if orig.shape[-1] == 1:
-            orig = orig.repeat(1, 1, 1, 3)
-            gen = gen.repeat(1, 1, 1, 3)
-
-        images = [
-            wandb.Image(orig[i].numpy(), caption=f"input {i}") for i in range(n)
-        ] + [wandb.Image(gen[i].numpy(), caption=f"sample {i}") for i in range(n)]
         self.logger.experiment.log(
-            {"val/ddpm_raw_samples": images},
+            {log_key: images},
             step=self.global_step,
         )

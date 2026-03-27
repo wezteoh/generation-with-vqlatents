@@ -11,7 +11,7 @@ from pytorch_lightning.loggers import WandbLogger
 
 from src.data.celebahq import CelebAHQ256DataModule
 from src.data.imagenet import ImageNetDataModule
-from src.data.mnist import MNISTDataModule
+from src.data.mnist import MNISTDataModule, MNISTLabeledDataModule
 from src.interfaces.ddpm_latent import DDPMLatentInterface
 from src.interfaces.ddpm_raw import DDPMRawInterface
 from src.interfaces.dsm_latent import DSMLatentInterface
@@ -27,11 +27,54 @@ def _build_datamodule(data_cfg: DictConfig) -> Any:
     params = OmegaConf.to_container(data_cfg.params, resolve=True)
     if data_cfg.name == "mnist":
         return MNISTDataModule(**params)
+    if data_cfg.name == "mnist_labeled":
+        return MNISTLabeledDataModule(**params)
     if data_cfg.name == "imagenet":
         return ImageNetDataModule(**params)
     if data_cfg.name == "celebahq256":
         return CelebAHQ256DataModule(**params)
     raise ValueError(f"Unsupported dataset: {data_cfg.name}")
+
+
+def _ddpm_conditioning_kwargs(model_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Parse optional `model.conditioning` for DDPM raw/latent interfaces."""
+    cond = model_cfg.get("conditioning")
+    if not cond:
+        return {
+            "conditioning_mode": "none",
+            "num_data_classes": None,
+            "label_key": "label",
+            "context_key": "context",
+            "unconditional_prob": 0.0,
+            "context_dim": None,
+            "transformer_depth": 1,
+        }
+    mode = str(cond.get("mode", "none"))
+    out: dict[str, Any] = {
+        "conditioning_mode": mode,
+        "label_key": str(cond.get("label_key", "label")),
+        "context_key": str(cond.get("context_key", "context")),
+        "unconditional_prob": float(cond.get("unconditional_prob", 0.0)),
+        "transformer_depth": int(cond.get("transformer_depth", 1)),
+    }
+    if mode == "class":
+        if "num_classes" not in cond:
+            raise ValueError(
+                "model.conditioning.num_classes is required when mode is 'class'"
+            )
+        out["num_data_classes"] = int(cond["num_classes"])
+        out["context_dim"] = None
+    elif mode == "context":
+        if "context_dim" not in cond:
+            raise ValueError(
+                "model.conditioning.context_dim is required when mode is 'context'"
+            )
+        out["context_dim"] = int(cond["context_dim"])
+        out["num_data_classes"] = None
+    else:
+        out["num_data_classes"] = None
+        out["context_dim"] = None
+    return out
 
 
 def _build_module(cfg: DictConfig) -> pl.LightningModule:
@@ -41,7 +84,9 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
     model_name = model_cfg.get("name", "vqvae")
     if model_name == "vqvae":
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
-        trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(
+            cfg.trainer.val_logging, resolve=True
+        )
 
         ddconfig = dict(model_cfg["ddconfig"])
         ddconfig["in_channels"] = int(cfg.data.in_channels)
@@ -61,7 +106,9 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
 
     if model_name == "vqgan":
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
-        trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(
+            cfg.trainer.val_logging, resolve=True
+        )
 
         ddconfig = dict(model_cfg["ddconfig"])
         ddconfig["in_channels"] = int(cfg.data.in_channels)
@@ -116,7 +163,9 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
         vq_embed_dim = int(vq_model_cfg["embed_dim"])
 
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
-        trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(
+            cfg.trainer.val_logging, resolve=True
+        )
 
         # Optional consistency checks if transformer_prior.yaml still specifies these fields.
         if "n_embed" in model_cfg and int(model_cfg["n_embed"]) != vq_n_embed:
@@ -169,7 +218,9 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
         vq_embed_dim = int(vq_model_cfg["embed_dim"])
 
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
-        trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(
+            cfg.trainer.val_logging, resolve=True
+        )
 
         # Optional consistency checks if dsm_latent.yaml also specifies these fields.
         if "n_embed" in model_cfg and int(model_cfg["n_embed"]) != vq_n_embed:
@@ -252,6 +303,8 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
         ch_mult = model_cfg.get("channel_mult", (1, 2, 4, 8))
         ch_mult = tuple(ch_mult)
 
+        ddpm_cond = _ddpm_conditioning_kwargs(model_cfg)
+
         return DDPMLatentInterface(
             ddconfig=vq_ddconfig,
             n_embed=vq_n_embed,
@@ -278,6 +331,7 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             ema_decay=float(model_cfg.get("ema_decay", 0.999)),
             val_logging=trainer_val_logging,
             sampling_cfg=model_cfg.get("sampling"),
+            **ddpm_cond,
         )
 
     if model_name == "ddpm_raw":
@@ -293,6 +347,8 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             att_res = tuple(att_res)
         ch_mult = model_cfg.get("channel_mult", (1, 2, 4, 8))
         ch_mult = tuple(ch_mult)
+
+        ddpm_cond = _ddpm_conditioning_kwargs(model_cfg)
 
         return DDPMRawInterface(
             in_channels=in_channels,
@@ -318,11 +374,14 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             ema_decay=float(model_cfg.get("ema_decay", 0.999)),
             val_logging=trainer_val_logging,
             sampling_cfg=model_cfg.get("sampling"),
+            **ddpm_cond,
         )
 
     if model_name == "dsm_raw":
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
-        trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(
+            cfg.trainer.val_logging, resolve=True
+        )
         in_channels = int(cfg.data.in_channels)
         image_size = int(cfg.data.params.image_size)
 
@@ -372,7 +431,9 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
         vq_embed_dim = int(vq_model_cfg["embed_dim"])
 
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
-        trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(
+            cfg.trainer.val_logging, resolve=True
+        )
 
         return ScoreSDEInterface(
             ddconfig=vq_ddconfig,
@@ -403,7 +464,9 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
 
     if model_name == "score_sde_raw":
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
-        trainer_val_logging = OmegaConf.to_container(cfg.trainer.val_logging, resolve=True)
+        trainer_val_logging = OmegaConf.to_container(
+            cfg.trainer.val_logging, resolve=True
+        )
 
         in_channels = int(cfg.data.in_channels)
         image_size = int(cfg.data.params.image_size)
@@ -468,7 +531,9 @@ def _print_model_tree(
     display_name = name or module.__class__.__name__
     if depth == 0:
         print(f"\n===== Model (top {max_depth} levels) =====")
-    print(f"{prefix}{display_name} ({module.__class__.__name__}): {param_count:,} params")
+    print(
+        f"{prefix}{display_name} ({module.__class__.__name__}): {param_count:,} params"
+    )
     if depth < max_depth - 1:
         for child_name, child in module.named_children():
             _print_model_tree(child, max_depth, prefix + "  ", depth + 1, child_name)
@@ -497,18 +562,20 @@ def _save_checkpoint_dir_config(cfg: DictConfig, ckpt_dir: str) -> None:
 
 def _resolve_vqvae_checkpoint_monitor(cfg: DictConfig) -> tuple[str, str]:
     """Return (monitor_key, filename_metric_token) for VQ-VAE checkpointing."""
-    raw = str(OmegaConf.select(cfg, "trainer.checkpoint.monitor_metric", default="rec_loss")).lower()
+    raw = str(
+        OmegaConf.select(cfg, "trainer.checkpoint.monitor_metric", default="rec_loss")
+    ).lower()
     if raw == "rec_loss":
         return "val/rec_loss", "val_rec_loss"
     if raw == "rfid":
         return "val/rfid", "val_rfid"
-    raise ValueError(
-        "trainer.checkpoint.monitor_metric must be one of: rec_loss, rfid"
-    )
+    raise ValueError("trainer.checkpoint.monitor_metric must be one of: rec_loss, rfid")
 
 
 @hydra.main(
-    config_path="configs", config_name="train_mnist_score_sde_ncsnv2_latent", version_base=None
+    config_path="configs",
+    config_name="train_mnist_score_sde_ncsnv2_latent",
+    version_base=None,
 )
 def main(cfg: DictConfig) -> None:
     pl.seed_everything(int(cfg.seed), workers=True)
@@ -550,7 +617,9 @@ def main(cfg: DictConfig) -> None:
         mode = "min"
         # Brace key must match logged metric name (val/rfid); token before "=" is a safe label.
         prefix = "vqgan" if model_name == "vqgan" else "vqvae"
-        filename = f"{prefix}-epoch={{epoch}}-step={{step}}-{metric_token}={{{monitor}:.4f}}"
+        filename = (
+            f"{prefix}-epoch={{epoch}}-step={{step}}-{metric_token}={{{monitor}:.4f}}"
+        )
         ckpt_auto_insert_metric_name = False
     callbacks = [
         ModelCheckpoint(

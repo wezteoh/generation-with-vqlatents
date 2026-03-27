@@ -1,5 +1,5 @@
 defaults:
-  - data: mnist
+  - data: mnist_labeled
   - model: ddpm_latent
   - _self_
 
@@ -11,7 +11,7 @@ hardware:
 
 wandb:
   enabled: true
-  project: ddpm-latent-training
+  project: ddpm-latent-cond-training
   entity: null
   name: null
   save_dir: ./wandb
@@ -42,6 +42,17 @@ trainer:
       num_real_samples: 512
       num_gen_samples: 512
       feature: 2048
+
+# Set model.vq_ckpt_path to your VQ-VAE checkpoint (directory with last.ckpt + config.yaml).
+model:
+  conditioning:
+    mode: class
+    num_classes: 10
+    label_key: label
+    unconditional_prob: 0.1
+  sampling:
+    clip_denoised: false
+    guidance_scale: 3.0
 
 hydra:
   run:

@@ -2,7 +2,7 @@
 # Override model.vq_ckpt_path to a checkpoint directory that contains last.ckpt and config.yaml.
 name: ddpm_latent
 
-vq_ckpt_path: null
+vq_ckpt_path: /root/code/generation-with-vqlatents/checkpoints/lbiwfopi/last.ckpt
 
 n_embed: 256
 embed_dim: 3
@@ -20,7 +20,7 @@ loss_type: l2
 l_simple_weight: 1.0
 original_elbo_weight: 0.0
 
-base_channels: 64
+base_channels: 32
 num_res_blocks: 2
 attention_resolutions: null
 channel_mult: [1, 2, 4]
@@ -29,5 +29,7 @@ logit_transform: true
 
 use_ema: true
 ema_decay: 0.999
+
+# See configs/model/ddpm_raw.yaml for `conditioning` and `sampling` examples (same keys).
 
 sampling: null

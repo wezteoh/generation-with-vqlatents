@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Raw-pixel DDPM (no VQ first stage). Keep in sync with LatentOpenAIUNetDDPM."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -14,6 +14,8 @@ from src.modules.latents.diffusion_backbones.utils import (
 )
 
 from .latent_openai_unet_ddpm import default_attention_resolutions
+
+ConditioningMode = Literal["none", "class", "context"]
 
 
 class RawOpenAIUNetDDPM(nn.Module):
@@ -35,6 +37,10 @@ class RawOpenAIUNetDDPM(nn.Module):
         channel_mult: tuple[int, ...] = (1, 2, 4, 8),
         dropout: float = 0.0,
         logit_transform: bool = False,
+        conditioning_mode: ConditioningMode = "none",
+        num_data_classes: Optional[int] = None,
+        context_dim: Optional[int] = None,
+        transformer_depth: int = 1,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
@@ -46,6 +52,37 @@ class RawOpenAIUNetDDPM(nn.Module):
                 f"parameterization must be 'eps' or 'x0', got {parameterization}"
             )
         self.logit_transform = bool(logit_transform)
+        self.conditioning_mode = conditioning_mode
+
+        if self.conditioning_mode == "class":
+            if num_data_classes is None or int(num_data_classes) < 1:
+                raise ValueError(
+                    "num_data_classes is required when conditioning_mode is 'class'"
+                )
+            self.num_data_classes = int(num_data_classes)
+            self.null_class_index = self.num_data_classes
+            unet_num_classes = self.num_data_classes + 1
+            use_spatial_transformer = False
+            ctx_dim = None
+        elif self.conditioning_mode == "context":
+            if context_dim is None or int(context_dim) < 1:
+                raise ValueError(
+                    "context_dim is required when conditioning_mode is 'context'"
+                )
+            self.num_data_classes = None
+            self.null_class_index = None
+            unet_num_classes = None
+            use_spatial_transformer = True
+            ctx_dim = int(context_dim)
+            self.context_dim = ctx_dim
+        else:
+            self.num_data_classes = None
+            self.null_class_index = None
+            unet_num_classes = None
+            use_spatial_transformer = False
+            ctx_dim = None
+
+        self.transformer_depth = int(transformer_depth)
 
         att_res = (
             attention_resolutions
@@ -64,13 +101,16 @@ class RawOpenAIUNetDDPM(nn.Module):
             channel_mult=channel_mult,
             conv_resample=True,
             dims=2,
-            num_classes=None,
+            num_classes=unet_num_classes,
             use_checkpoint=False,
             use_fp16=False,
             num_head_channels=32,
             use_scale_shift_norm=False,
             resblock_updown=False,
             use_new_attention_order=False,
+            use_spatial_transformer=use_spatial_transformer,
+            transformer_depth=self.transformer_depth,
+            context_dim=ctx_dim,
         )
 
         self.register_schedule(
@@ -157,9 +197,42 @@ class RawOpenAIUNetDDPM(nn.Module):
             return 2.0 * x - 1.0
         return x
 
-    def forward(self, x: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         x_in = self._input_scaling(x)
-        return self.backbone(x_in, timesteps=timesteps.long())
+        ts = timesteps.long()
+        if self.conditioning_mode == "none":
+            return self.backbone(x_in, timesteps=ts)
+        if self.conditioning_mode == "class":
+            return self.backbone(x_in, timesteps=ts, y=y)
+        return self.backbone(x_in, timesteps=ts, context=context)
+
+    def _model_out_with_cfg(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: Optional[torch.Tensor],
+        context: Optional[torch.Tensor],
+        guidance_scale: float,
+    ) -> torch.Tensor:
+        if self.conditioning_mode == "none" or guidance_scale == 1.0:
+            return self.forward(x, t, y=y, context=context)
+        if self.conditioning_mode == "class":
+            assert y is not None and self.null_class_index is not None
+            y_null = torch.full_like(y, self.null_class_index)
+            out_c = self.forward(x, t, y=y, context=None)
+            out_u = self.forward(x, t, y=y_null, context=None)
+        else:
+            assert context is not None and self.conditioning_mode == "context"
+            ctx_null = torch.zeros_like(context)
+            out_c = self.forward(x, t, y=None, context=context)
+            out_u = self.forward(x, t, y=None, context=ctx_null)
+        return out_u + guidance_scale * (out_c - out_u)
 
     def q_sample(
         self,
@@ -190,8 +263,11 @@ class RawOpenAIUNetDDPM(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         clip_denoised: bool,
+        y: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        model_out = self.forward(x, t)
+        model_out = self._model_out_with_cfg(x, t, y, context, guidance_scale)
         if self.parameterization == "eps":
             pred_x0 = self._predict_x0_from_eps(x, t, model_out)
         else:
@@ -214,9 +290,17 @@ class RawOpenAIUNetDDPM(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         clip_denoised: bool,
+        y: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         model_mean, model_log_variance, _ = self._p_mean_variance(
-            x, t, clip_denoised=clip_denoised
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            y=y,
+            context=context,
+            guidance_scale=guidance_scale,
         )
         noise = torch.randn_like(x)
         nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
@@ -229,6 +313,9 @@ class RawOpenAIUNetDDPM(nn.Module):
         latent_shape: tuple[int, int, int, int],
         device: Optional[torch.device] = None,
         clip_denoised: bool = False,
+        y: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         """Ancestral DDPM sampling; `latent_shape` is image shape (B, C, H, W)."""
         if device is None:
@@ -240,8 +327,35 @@ class RawOpenAIUNetDDPM(nn.Module):
         _, c, h, w = latent_shape
         x = torch.randn(batch_size, c, h, w, device=device)
 
+        if self.conditioning_mode == "class":
+            assert self.null_class_index is not None
+            if y is None:
+                y = torch.full(
+                    (batch_size,),
+                    self.null_class_index,
+                    device=device,
+                    dtype=torch.long,
+                )
+        elif self.conditioning_mode == "context":
+            if context is None:
+                n_hw = h * w
+                context = torch.zeros(
+                    batch_size,
+                    n_hw,
+                    self.context_dim,
+                    device=device,
+                    dtype=x.dtype,
+                )
+
         for i in reversed(range(self.num_timesteps)):
             t = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            x = self._p_sample(x, t, clip_denoised=clip_denoised)
+            x = self._p_sample(
+                x,
+                t,
+                clip_denoised=clip_denoised,
+                y=y,
+                context=context,
+                guidance_scale=guidance_scale,
+            )
 
         return x
