@@ -29,14 +29,15 @@ def default_attention_resolutions(image_size: int) -> tuple[int, ...]:
 ConditioningMode = Literal["none", "class", "context"]
 
 
-class LatentOpenAIUNetDDPM(nn.Module):
-    """DDPM noise predictor over VQ latents using the OpenAI UNet backbone."""
+class OpenAIUNetDDPM(nn.Module):
+    """DDPM noise predictor (OpenAI UNet); optional frozen VQ first stage."""
 
     def __init__(
         self,
-        first_stage_model: nn.Module,
         in_channels: int,
         image_size: int,
+        *,
+        first_stage_model: Optional[nn.Module] = None,
         num_timesteps: int = 1000,
         beta_schedule: str = "linear",
         linear_start: float = 1e-4,
@@ -48,7 +49,7 @@ class LatentOpenAIUNetDDPM(nn.Module):
         attention_resolutions: Optional[tuple[int, ...]] = None,
         channel_mult: tuple[int, ...] = (1, 2, 4, 8),
         dropout: float = 0.0,
-        logit_transform: bool = True,
+        logit_transform: bool = False,
         conditioning_mode: ConditioningMode = "none",
         num_data_classes: Optional[int] = None,
         context_dim: Optional[int] = None,
@@ -56,7 +57,8 @@ class LatentOpenAIUNetDDPM(nn.Module):
     ) -> None:
         super().__init__()
         self.first_stage_model = first_stage_model
-        _freeze_first_stage(self.first_stage_model)
+        if self.first_stage_model is not None:
+            _freeze_first_stage(self.first_stage_model)
 
         self.in_channels = int(in_channels)
         self.image_size = int(image_size)
@@ -191,7 +193,6 @@ class LatentOpenAIUNetDDPM(nn.Module):
         self.register_buffer("posterior_mean_coef1", posterior_mean_coef1)
         self.register_buffer("posterior_mean_coef2", posterior_mean_coef2)
 
-        # Per-timestep weights for hybrid simple + VLB-style loss (CompVis DDPM).
         if self.parameterization == "eps":
             lvlb_weights = betas**2 / (
                 2.0 * posterior_variance * alphas * (1.0 - alphas_cumprod)
@@ -329,6 +330,8 @@ class LatentOpenAIUNetDDPM(nn.Module):
 
     @torch.no_grad()
     def quantize_and_decode(self, latents: torch.Tensor) -> torch.Tensor:
+        if self.first_stage_model is None:
+            raise RuntimeError("quantize_and_decode requires a first_stage_model")
         quant, _, _ = self.first_stage_model.quantize(latents)
         return self.first_stage_model.decode(quant)
 
@@ -385,3 +388,7 @@ class LatentOpenAIUNetDDPM(nn.Module):
             )
 
         return x
+
+
+LatentOpenAIUNetDDPM = OpenAIUNetDDPM
+RawOpenAIUNetDDPM = OpenAIUNetDDPM

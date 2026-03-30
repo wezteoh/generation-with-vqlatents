@@ -12,12 +12,10 @@ from pytorch_lightning.loggers import WandbLogger
 from src.data.celebahq import CelebAHQ256DataModule
 from src.data.imagenet import ImageNetDataModule
 from src.data.mnist import MNISTDataModule, MNISTLabeledDataModule
-from src.interfaces.ddpm_latent import DDPMLatentInterface
-from src.interfaces.ddpm_raw import DDPMRawInterface
-from src.interfaces.dsm_latent import DSMLatentInterface
-from src.interfaces.dsm_raw import DSMRawInterface
-from src.interfaces.score_sde_latent import ScoreSDEInterface
-from src.interfaces.score_sde_raw import ScoreSDERawInterface
+from src.interfaces.ddpm import DDPMLatentInterface, DDPMRawInterface
+from src.interfaces.dsm import DSMLatentInterface, DSMRawInterface
+from src.interfaces.score_sde import ScoreSDEInterface, ScoreSDERawInterface
+from src.utils.vqvae_ckpt import load_vqvae_meta_from_ckpt_path
 from src.interfaces.transformer_latent import TransformerLatentInterface
 from src.interfaces.vqgan import VQGANInterface
 from src.interfaces.vqvae import VQVAEInterface
@@ -75,6 +73,41 @@ def _ddpm_conditioning_kwargs(model_cfg: dict[str, Any]) -> dict[str, Any]:
         out["num_data_classes"] = None
         out["context_dim"] = None
     return out
+
+
+def _vq_path_configured(model_cfg: dict[str, Any]) -> bool:
+    v = model_cfg.get("vq_ckpt_path")
+    return v is not None and str(v).lower() != "null"
+
+
+def _ddpm_wants_latent(model_name: str, model_cfg: dict[str, Any]) -> bool:
+    if model_name == "ddpm_latent":
+        return True
+    if model_name == "ddpm_raw":
+        return False
+    if model_name == "ddpm":
+        return _vq_path_configured(model_cfg)
+    raise ValueError(f"Not a DDPM model name: {model_name}")
+
+
+def _dsm_wants_latent(model_name: str, model_cfg: dict[str, Any]) -> bool:
+    if model_name == "dsm_latent":
+        return True
+    if model_name == "dsm_raw":
+        return False
+    if model_name == "dsm":
+        return _vq_path_configured(model_cfg)
+    raise ValueError(f"Not a DSM model name: {model_name}")
+
+
+def _score_sde_wants_latent(model_name: str, model_cfg: dict[str, Any]) -> bool:
+    if model_name == "score_sde_latent":
+        return True
+    if model_name == "score_sde_raw":
+        return False
+    if model_name == "score_sde":
+        return _vq_path_configured(model_cfg)
+    raise ValueError(f"Not a Score-SDE model name: {model_name}")
 
 
 def _build_module(cfg: DictConfig) -> pl.LightningModule:
@@ -145,36 +178,27 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
         vq_ckpt = model_cfg.get("vq_ckpt_path")
         if not vq_ckpt or str(vq_ckpt).lower() == "null":
             raise ValueError(
-                "Prior model requires model.vq_ckpt_path to point to a trained VQ-VAE checkpoint. "
-                "Override with e.g. model.vq_ckpt_path=checkpoints/xyz/vqvae-last.ckpt"
+                "Prior model needs model.vq_ckpt_path to a trained VQ-VAE checkpoint "
+                "(e.g. model.vq_ckpt_path=checkpoints/xyz/vqvae-last.ckpt)."
             )
 
-        ckpt_dir = os.path.dirname(str(vq_ckpt))
-        ckpt_cfg_path = os.path.join(ckpt_dir, "config.yaml")
-        if not os.path.exists(ckpt_cfg_path):
-            raise FileNotFoundError(
-                f"Expected VQ-VAE config at {ckpt_cfg_path}. "
-                "Ensure you saved config.yaml in the checkpoint folder when training VQ-VAE."
-            )
-        ckpt_cfg = OmegaConf.load(ckpt_cfg_path)
-        vq_model_cfg = OmegaConf.to_container(ckpt_cfg.model, resolve=True)
-        vq_ddconfig = dict(vq_model_cfg["ddconfig"])
-        vq_n_embed = int(vq_model_cfg["n_embed"])
-        vq_embed_dim = int(vq_model_cfg["embed_dim"])
+        vq_ddconfig, vq_n_embed, vq_embed_dim = load_vqvae_meta_from_ckpt_path(
+            str(vq_ckpt)
+        )
 
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
         trainer_val_logging = OmegaConf.to_container(
             cfg.trainer.val_logging, resolve=True
         )
 
-        # Optional consistency checks if transformer_prior.yaml still specifies these fields.
+        # Optional checks if transformer_prior.yaml lists n_embed / embed_dim.
         if "n_embed" in model_cfg and int(model_cfg["n_embed"]) != vq_n_embed:
             raise ValueError(
-                "transformer_prior.n_embed does not match VQ-VAE n_embed in checkpoint config"
+                "transformer_prior.n_embed does not match VQ-VAE config n_embed"
             )
         if "embed_dim" in model_cfg and int(model_cfg["embed_dim"]) != vq_embed_dim:
             raise ValueError(
-                "transformer_prior.embed_dim does not match VQ-VAE embed_dim in checkpoint config"
+                "transformer_prior.embed_dim does not match VQ-VAE config embed_dim"
             )
 
         return TransformerLatentInterface(
@@ -196,287 +220,198 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             val_logging=trainer_val_logging,
         )
 
-    if model_name == "dsm_latent":
-        vq_ckpt = model_cfg.get("vq_ckpt_path")
-        if not vq_ckpt or str(vq_ckpt).lower() == "null":
-            raise ValueError(
-                "DSM latent requires model.vq_ckpt_path to point to a trained VQ-VAE checkpoint. "
-                "Override with e.g. model.vq_ckpt_path=checkpoints/xyz/vqvae-last.ckpt"
-            )
-
-        ckpt_dir = os.path.dirname(str(vq_ckpt))
-        ckpt_cfg_path = os.path.join(ckpt_dir, "config.yaml")
-        if not os.path.exists(ckpt_cfg_path):
-            raise FileNotFoundError(
-                f"Expected VQ-VAE config at {ckpt_cfg_path}. "
-                "Ensure you saved config.yaml in the checkpoint folder when training VQ-VAE."
-            )
-        ckpt_cfg = OmegaConf.load(ckpt_cfg_path)
-        vq_model_cfg = OmegaConf.to_container(ckpt_cfg.model, resolve=True)
-        vq_ddconfig = dict(vq_model_cfg["ddconfig"])
-        vq_n_embed = int(vq_model_cfg["n_embed"])
-        vq_embed_dim = int(vq_model_cfg["embed_dim"])
-
+    if model_name in ("dsm", "dsm_latent", "dsm_raw"):
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
         trainer_val_logging = OmegaConf.to_container(
             cfg.trainer.val_logging, resolve=True
         )
-
-        # Optional consistency checks if dsm_latent.yaml also specifies these fields.
-        if "n_embed" in model_cfg and int(model_cfg["n_embed"]) != vq_n_embed:
-            raise ValueError(
-                "dsm_latent.n_embed does not match VQ-VAE n_embed in checkpoint config"
+        want_latent = _dsm_wants_latent(model_name, model_cfg)
+        if want_latent:
+            if not _vq_path_configured(model_cfg):
+                raise ValueError(
+                    f"{model_name} requires model.vq_ckpt_path to point to a trained "
+                    "VQ-VAE checkpoint."
+                )
+            vq_ckpt = str(model_cfg["vq_ckpt_path"])
+            vq_ddconfig, vq_n_embed, vq_embed_dim = load_vqvae_meta_from_ckpt_path(
+                vq_ckpt
             )
-        if "embed_dim" in model_cfg and int(model_cfg["embed_dim"]) != vq_embed_dim:
-            raise ValueError(
-                "dsm_latent.embed_dim does not match VQ-VAE embed_dim in checkpoint config"
+            if "n_embed" in model_cfg and int(model_cfg["n_embed"]) != vq_n_embed:
+                raise ValueError(
+                    f"{model_name}.n_embed does not match VQ-VAE config n_embed"
+                )
+            if "embed_dim" in model_cfg and int(model_cfg["embed_dim"]) != vq_embed_dim:
+                raise ValueError(
+                    f"{model_name}.embed_dim does not match VQ-VAE config embed_dim"
+                )
+            return DSMLatentInterface(
+                ddconfig=vq_ddconfig,
+                n_embed=vq_n_embed,
+                embed_dim=vq_embed_dim,
+                vq_ckpt_path=vq_ckpt,
+                min_sigma=float(model_cfg.get("min_sigma", 0.01)),
+                max_sigma=float(model_cfg.get("max_sigma", 0.2)),
+                num_sigmas=int(model_cfg.get("num_sigmas", 4)),
+                base_channels=int(model_cfg.get("base_channels", 64)),
+                image_key=image_key,
+                learning_rate=float(trainer_optim["learning_rate"]),
+                anneal_power=float(model_cfg.get("anneal_power", 2.0)),
+                use_annealed_loss=bool(model_cfg.get("use_annealed_loss", True)),
+                val_logging=trainer_val_logging,
+                score_backbone=str(model_cfg.get("score_backbone", "unet")),
+                use_ema=bool(model_cfg.get("use_ema", True)),
+                ema_decay=float(model_cfg.get("ema_decay", 0.999)),
             )
-
-        min_sigma = float(model_cfg.get("min_sigma", 0.01))
-        max_sigma = float(model_cfg.get("max_sigma", 0.2))
-        num_sigmas = int(model_cfg.get("num_sigmas", 4))
-        score_backbone = str(model_cfg.get("score_backbone", "unet"))
-        use_ema = bool(model_cfg.get("use_ema", True))
-        ema_decay = float(model_cfg.get("ema_decay", 0.999))
-
-        return DSMLatentInterface(
-            ddconfig=vq_ddconfig,
-            n_embed=vq_n_embed,
-            embed_dim=vq_embed_dim,
-            vq_ckpt_path=str(vq_ckpt),
-            min_sigma=min_sigma,
-            max_sigma=max_sigma,
-            num_sigmas=num_sigmas,
-            base_channels=int(model_cfg.get("base_channels", 64)),
-            image_key=image_key,
-            learning_rate=float(trainer_optim["learning_rate"]),
-            anneal_power=float(model_cfg.get("anneal_power", 2.0)),
-            use_annealed_loss=bool(model_cfg.get("use_annealed_loss", True)),
-            val_logging=trainer_val_logging,
-            score_backbone=score_backbone,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
-        )
-
-    if model_name == "ddpm_latent":
-        vq_ckpt = model_cfg.get("vq_ckpt_path")
-        if not vq_ckpt or str(vq_ckpt).lower() == "null":
-            raise ValueError(
-                "DDPM latent requires model.vq_ckpt_path to point to a trained "
-                "VQ-VAE checkpoint. "
-                "Override with e.g. model.vq_ckpt_path=checkpoints/xyz/vqvae-last.ckpt"
-            )
-
-        ckpt_dir = os.path.dirname(str(vq_ckpt))
-        ckpt_cfg_path = os.path.join(ckpt_dir, "config.yaml")
-        if not os.path.exists(ckpt_cfg_path):
-            raise FileNotFoundError(
-                f"Expected VQ-VAE config at {ckpt_cfg_path}. "
-                "Ensure you saved config.yaml in the checkpoint folder when "
-                "training VQ-VAE."
-            )
-        ckpt_cfg = OmegaConf.load(ckpt_cfg_path)
-        vq_model_cfg = OmegaConf.to_container(ckpt_cfg.model, resolve=True)
-        vq_ddconfig = dict(vq_model_cfg["ddconfig"])
-        vq_n_embed = int(vq_model_cfg["n_embed"])
-        vq_embed_dim = int(vq_model_cfg["embed_dim"])
-
-        trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
-        trainer_val_logging = OmegaConf.to_container(
-            cfg.trainer.val_logging, resolve=True
-        )
-
-        if "n_embed" in model_cfg and int(model_cfg["n_embed"]) != vq_n_embed:
-            raise ValueError(
-                "ddpm_latent.n_embed does not match VQ-VAE n_embed in "
-                "checkpoint config"
-            )
-        if "embed_dim" in model_cfg and int(model_cfg["embed_dim"]) != vq_embed_dim:
-            raise ValueError(
-                "ddpm_latent.embed_dim does not match VQ-VAE embed_dim in "
-                "checkpoint config"
-            )
-
-        att_res = model_cfg.get("attention_resolutions")
-        if att_res is not None:
-            att_res = tuple(att_res)
-        ch_mult = model_cfg.get("channel_mult", (1, 2, 4, 8))
-        ch_mult = tuple(ch_mult)
-
-        ddpm_cond = _ddpm_conditioning_kwargs(model_cfg)
-
-        return DDPMLatentInterface(
-            ddconfig=vq_ddconfig,
-            n_embed=vq_n_embed,
-            embed_dim=vq_embed_dim,
-            vq_ckpt_path=str(vq_ckpt),
-            image_key=image_key,
-            learning_rate=float(trainer_optim["learning_rate"]),
-            timesteps=int(model_cfg.get("timesteps", 1000)),
-            beta_schedule=str(model_cfg.get("beta_schedule", "linear")),
-            linear_start=float(model_cfg.get("linear_start", 1e-4)),
-            linear_end=float(model_cfg.get("linear_end", 2e-2)),
-            cosine_s=float(model_cfg.get("cosine_s", 8e-3)),
-            parameterization=str(model_cfg.get("parameterization", "eps")),
-            loss_type=str(model_cfg.get("loss_type", "l2")),
-            l_simple_weight=float(model_cfg.get("l_simple_weight", 1.0)),
-            original_elbo_weight=float(model_cfg.get("original_elbo_weight", 0.0)),
-            base_channels=int(model_cfg.get("base_channels", 64)),
-            num_res_blocks=int(model_cfg.get("num_res_blocks", 2)),
-            attention_resolutions=att_res,
-            channel_mult=ch_mult,
-            dropout=float(model_cfg.get("dropout", 0.0)),
-            logit_transform=bool(model_cfg.get("logit_transform", True)),
-            use_ema=bool(model_cfg.get("use_ema", False)),
-            ema_decay=float(model_cfg.get("ema_decay", 0.999)),
-            val_logging=trainer_val_logging,
-            sampling_cfg=model_cfg.get("sampling"),
-            **ddpm_cond,
-        )
-
-    if model_name == "ddpm_raw":
-        trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
-        trainer_val_logging = OmegaConf.to_container(
-            cfg.trainer.val_logging, resolve=True
-        )
-        in_channels = int(cfg.data.in_channels)
-        image_size = int(cfg.data.params.image_size)
-
-        att_res = model_cfg.get("attention_resolutions")
-        if att_res is not None:
-            att_res = tuple(att_res)
-        ch_mult = model_cfg.get("channel_mult", (1, 2, 4, 8))
-        ch_mult = tuple(ch_mult)
-
-        ddpm_cond = _ddpm_conditioning_kwargs(model_cfg)
-
-        return DDPMRawInterface(
-            in_channels=in_channels,
-            image_size=image_size,
-            image_key=image_key,
-            learning_rate=float(trainer_optim["learning_rate"]),
-            timesteps=int(model_cfg.get("timesteps", 1000)),
-            beta_schedule=str(model_cfg.get("beta_schedule", "linear")),
-            linear_start=float(model_cfg.get("linear_start", 1e-4)),
-            linear_end=float(model_cfg.get("linear_end", 2e-2)),
-            cosine_s=float(model_cfg.get("cosine_s", 8e-3)),
-            parameterization=str(model_cfg.get("parameterization", "eps")),
-            loss_type=str(model_cfg.get("loss_type", "l2")),
-            l_simple_weight=float(model_cfg.get("l_simple_weight", 1.0)),
-            original_elbo_weight=float(model_cfg.get("original_elbo_weight", 0.0)),
-            base_channels=int(model_cfg.get("base_channels", 64)),
-            num_res_blocks=int(model_cfg.get("num_res_blocks", 2)),
-            attention_resolutions=att_res,
-            channel_mult=ch_mult,
-            dropout=float(model_cfg.get("dropout", 0.0)),
-            logit_transform=bool(model_cfg.get("logit_transform", False)),
-            use_ema=bool(model_cfg.get("use_ema", False)),
-            ema_decay=float(model_cfg.get("ema_decay", 0.999)),
-            val_logging=trainer_val_logging,
-            sampling_cfg=model_cfg.get("sampling"),
-            **ddpm_cond,
-        )
-
-    if model_name == "dsm_raw":
-        trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
-        trainer_val_logging = OmegaConf.to_container(
-            cfg.trainer.val_logging, resolve=True
-        )
-        in_channels = int(cfg.data.in_channels)
-        image_size = int(cfg.data.params.image_size)
-
-        min_sigma = float(model_cfg.get("min_sigma", 0.01))
-        max_sigma = float(model_cfg.get("max_sigma", 0.2))
-        num_sigmas = int(model_cfg.get("num_sigmas", 4))
-        score_backbone = str(model_cfg.get("score_backbone", "unet"))
-        use_ema = bool(model_cfg.get("use_ema", True))
-        ema_decay = float(model_cfg.get("ema_decay", 0.999))
 
         return DSMRawInterface(
-            in_channels=in_channels,
-            image_size=image_size,
-            min_sigma=min_sigma,
-            max_sigma=max_sigma,
-            num_sigmas=num_sigmas,
+            in_channels=int(cfg.data.in_channels),
+            image_size=int(cfg.data.params.image_size),
+            min_sigma=float(model_cfg.get("min_sigma", 0.01)),
+            max_sigma=float(model_cfg.get("max_sigma", 0.2)),
+            num_sigmas=int(model_cfg.get("num_sigmas", 4)),
             base_channels=int(model_cfg.get("base_channels", 64)),
             image_key=image_key,
             learning_rate=float(trainer_optim["learning_rate"]),
             anneal_power=float(model_cfg.get("anneal_power", 2.0)),
             use_annealed_loss=bool(model_cfg.get("use_annealed_loss", True)),
             val_logging=trainer_val_logging,
-            score_backbone=score_backbone,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
+            score_backbone=str(model_cfg.get("score_backbone", "unet")),
+            use_ema=bool(model_cfg.get("use_ema", True)),
+            ema_decay=float(model_cfg.get("ema_decay", 0.999)),
         )
 
-    if model_name == "score_sde_latent":
-        vq_ckpt = model_cfg.get("vq_ckpt_path")
-        if not vq_ckpt or str(vq_ckpt).lower() == "null":
-            raise ValueError(
-                "Score-SDE requires model.vq_ckpt_path to point to a trained VQ-VAE checkpoint. "
-                "Override with e.g. model.vq_ckpt_path=checkpoints/xyz/vqvae-last.ckpt"
-            )
-
-        ckpt_dir = os.path.dirname(str(vq_ckpt))
-        ckpt_cfg_path = os.path.join(ckpt_dir, "config.yaml")
-        if not os.path.exists(ckpt_cfg_path):
-            raise FileNotFoundError(
-                f"Expected VQ-VAE config at {ckpt_cfg_path}. "
-                "Ensure you saved config.yaml in the checkpoint folder when training VQ-VAE."
-            )
-        ckpt_cfg = OmegaConf.load(ckpt_cfg_path)
-        vq_model_cfg = OmegaConf.to_container(ckpt_cfg.model, resolve=True)
-        vq_ddconfig = dict(vq_model_cfg["ddconfig"])
-        vq_n_embed = int(vq_model_cfg["n_embed"])
-        vq_embed_dim = int(vq_model_cfg["embed_dim"])
-
+    if model_name in ("ddpm", "ddpm_latent", "ddpm_raw"):
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
         trainer_val_logging = OmegaConf.to_container(
             cfg.trainer.val_logging, resolve=True
         )
+        att_res = model_cfg.get("attention_resolutions")
+        if att_res is not None:
+            att_res = tuple(att_res)
+        ch_mult = model_cfg.get("channel_mult", (1, 2, 4, 8))
+        ch_mult = tuple(ch_mult)
+        ddpm_cond = _ddpm_conditioning_kwargs(model_cfg)
 
-        return ScoreSDEInterface(
-            ddconfig=vq_ddconfig,
-            n_embed=vq_n_embed,
-            embed_dim=vq_embed_dim,
-            vq_ckpt_path=str(vq_ckpt),
+        want_latent = _ddpm_wants_latent(model_name, model_cfg)
+        if want_latent:
+            if not _vq_path_configured(model_cfg):
+                raise ValueError(
+                    f"{model_name} requires model.vq_ckpt_path to point to a trained "
+                    "VQ-VAE checkpoint."
+                )
+            vq_ckpt = str(model_cfg["vq_ckpt_path"])
+            vq_ddconfig, vq_n_embed, vq_embed_dim = load_vqvae_meta_from_ckpt_path(
+                vq_ckpt
+            )
+            if "n_embed" in model_cfg and int(model_cfg["n_embed"]) != vq_n_embed:
+                raise ValueError(
+                    f"{model_name}.n_embed does not match VQ-VAE config n_embed"
+                )
+            if "embed_dim" in model_cfg and int(model_cfg["embed_dim"]) != vq_embed_dim:
+                raise ValueError(
+                    f"{model_name}.embed_dim does not match VQ-VAE config embed_dim"
+                )
+            return DDPMLatentInterface(
+                ddconfig=vq_ddconfig,
+                n_embed=vq_n_embed,
+                embed_dim=vq_embed_dim,
+                vq_ckpt_path=vq_ckpt,
+                image_key=image_key,
+                learning_rate=float(trainer_optim["learning_rate"]),
+                timesteps=int(model_cfg.get("timesteps", 1000)),
+                beta_schedule=str(model_cfg.get("beta_schedule", "linear")),
+                linear_start=float(model_cfg.get("linear_start", 1e-4)),
+                linear_end=float(model_cfg.get("linear_end", 2e-2)),
+                cosine_s=float(model_cfg.get("cosine_s", 8e-3)),
+                parameterization=str(model_cfg.get("parameterization", "eps")),
+                loss_type=str(model_cfg.get("loss_type", "l2")),
+                l_simple_weight=float(model_cfg.get("l_simple_weight", 1.0)),
+                original_elbo_weight=float(model_cfg.get("original_elbo_weight", 0.0)),
+                base_channels=int(model_cfg.get("base_channels", 64)),
+                num_res_blocks=int(model_cfg.get("num_res_blocks", 2)),
+                attention_resolutions=att_res,
+                channel_mult=ch_mult,
+                dropout=float(model_cfg.get("dropout", 0.0)),
+                logit_transform=bool(model_cfg.get("logit_transform", True)),
+                use_ema=bool(model_cfg.get("use_ema", False)),
+                ema_decay=float(model_cfg.get("ema_decay", 0.999)),
+                val_logging=trainer_val_logging,
+                sampling_cfg=model_cfg.get("sampling"),
+                **ddpm_cond,
+            )
+
+        return DDPMRawInterface(
+            in_channels=int(cfg.data.in_channels),
+            image_size=int(cfg.data.params.image_size),
             image_key=image_key,
             learning_rate=float(trainer_optim["learning_rate"]),
-            # SDE/time options
-            sde_type=str(model_cfg.get("sde_type", "vesde")),
-            sde_n=int(model_cfg.get("sde_n", 1000)),
-            sigma_min=float(model_cfg.get("sigma_min", 0.01)),
-            sigma_max=float(model_cfg.get("sigma_max", 50.0)),
-            beta_min=float(model_cfg.get("beta_min", 0.1)),
-            beta_max=float(model_cfg.get("beta_max", 20.0)),
-            continuous=bool(model_cfg.get("continuous", True)),
-            t_eps=float(model_cfg.get("t_eps", 1e-3)),
-            likelihood_weighting=bool(model_cfg.get("likelihood_weighting", True)),
-            # Model/backbone
+            timesteps=int(model_cfg.get("timesteps", 1000)),
+            beta_schedule=str(model_cfg.get("beta_schedule", "linear")),
+            linear_start=float(model_cfg.get("linear_start", 1e-4)),
+            linear_end=float(model_cfg.get("linear_end", 2e-2)),
+            cosine_s=float(model_cfg.get("cosine_s", 8e-3)),
+            parameterization=str(model_cfg.get("parameterization", "eps")),
+            loss_type=str(model_cfg.get("loss_type", "l2")),
+            l_simple_weight=float(model_cfg.get("l_simple_weight", 1.0)),
+            original_elbo_weight=float(model_cfg.get("original_elbo_weight", 0.0)),
             base_channels=int(model_cfg.get("base_channels", 64)),
+            num_res_blocks=int(model_cfg.get("num_res_blocks", 2)),
+            attention_resolutions=att_res,
+            channel_mult=ch_mult,
+            dropout=float(model_cfg.get("dropout", 0.0)),
             logit_transform=bool(model_cfg.get("logit_transform", False)),
-            # EMA
             use_ema=bool(model_cfg.get("use_ema", False)),
             ema_decay=float(model_cfg.get("ema_decay", 0.999)),
             val_logging=trainer_val_logging,
             sampling_cfg=model_cfg.get("sampling"),
+            **ddpm_cond,
         )
 
-    if model_name == "score_sde_raw":
+    if model_name in ("score_sde", "score_sde_latent", "score_sde_raw"):
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
         trainer_val_logging = OmegaConf.to_container(
             cfg.trainer.val_logging, resolve=True
         )
-
-        in_channels = int(cfg.data.in_channels)
-        image_size = int(cfg.data.params.image_size)
+        want_latent = _score_sde_wants_latent(model_name, model_cfg)
+        if want_latent:
+            if not _vq_path_configured(model_cfg):
+                raise ValueError(
+                    f"{model_name} requires model.vq_ckpt_path to point to a trained "
+                    "VQ-VAE checkpoint."
+                )
+            vq_ckpt = str(model_cfg["vq_ckpt_path"])
+            vq_ddconfig, vq_n_embed, vq_embed_dim = load_vqvae_meta_from_ckpt_path(
+                vq_ckpt
+            )
+            return ScoreSDEInterface(
+                ddconfig=vq_ddconfig,
+                n_embed=vq_n_embed,
+                embed_dim=vq_embed_dim,
+                vq_ckpt_path=vq_ckpt,
+                image_key=image_key,
+                learning_rate=float(trainer_optim["learning_rate"]),
+                sde_type=str(model_cfg.get("sde_type", "vesde")),
+                sde_n=int(model_cfg.get("sde_n", 1000)),
+                sigma_min=float(model_cfg.get("sigma_min", 0.01)),
+                sigma_max=float(model_cfg.get("sigma_max", 50.0)),
+                beta_min=float(model_cfg.get("beta_min", 0.1)),
+                beta_max=float(model_cfg.get("beta_max", 20.0)),
+                continuous=bool(model_cfg.get("continuous", True)),
+                t_eps=float(model_cfg.get("t_eps", 1e-3)),
+                likelihood_weighting=bool(model_cfg.get("likelihood_weighting", True)),
+                base_channels=int(model_cfg.get("base_channels", 64)),
+                logit_transform=bool(model_cfg.get("logit_transform", False)),
+                use_ema=bool(model_cfg.get("use_ema", False)),
+                ema_decay=float(model_cfg.get("ema_decay", 0.999)),
+                val_logging=trainer_val_logging,
+                sampling_cfg=model_cfg.get("sampling"),
+            )
 
         return ScoreSDERawInterface(
-            in_channels=in_channels,
-            image_size=image_size,
+            in_channels=int(cfg.data.in_channels),
+            image_size=int(cfg.data.params.image_size),
             image_key=image_key,
             learning_rate=float(trainer_optim["learning_rate"]),
-            # SDE/time options
             sde_type=str(model_cfg.get("sde_type", "vesde")),
             sde_n=int(model_cfg.get("sde_n", 1000)),
             sigma_min=float(model_cfg.get("sigma_min", 0.01)),
@@ -486,10 +421,8 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             continuous=bool(model_cfg.get("continuous", True)),
             t_eps=float(model_cfg.get("t_eps", 1e-3)),
             likelihood_weighting=bool(model_cfg.get("likelihood_weighting", True)),
-            # Model/backbone
             base_channels=int(model_cfg.get("base_channels", 64)),
             logit_transform=bool(model_cfg.get("logit_transform", False)),
-            # EMA
             use_ema=bool(model_cfg.get("use_ema", False)),
             ema_decay=float(model_cfg.get("ema_decay", 0.999)),
             val_logging=trainer_val_logging,
@@ -603,10 +536,13 @@ def main(cfg: DictConfig) -> None:
     model_name = OmegaConf.select(cfg, "model.name", default="vqvae")
     if model_name in (
         "transformer_latent",
+        "ddpm",
         "ddpm_latent",
         "ddpm_raw",
+        "dsm",
         "dsm_latent",
         "dsm_raw",
+        "score_sde",
         "score_sde_latent",
         "score_sde_raw",
     ):
@@ -615,7 +551,7 @@ def main(cfg: DictConfig) -> None:
     else:
         monitor, metric_token = _resolve_vqvae_checkpoint_monitor(cfg)
         mode = "min"
-        # Brace key must match logged metric name (val/rfid); token before "=" is a safe label.
+        # Brace key must match logged metric name; token before "=" is a safe label.
         prefix = "vqgan" if model_name == "vqgan" else "vqvae"
         filename = (
             f"{prefix}-epoch={{epoch}}-step={{step}}-{metric_token}={{{monitor}:.4f}}"

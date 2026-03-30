@@ -1,0 +1,26 @@
+# Canonical Score-SDE: raw if `vq_ckpt_path` is null/absent; latent if set.
+name: score_sde
+
+vq_ckpt_path: null
+
+base_channels: 64
+sde_type: vesde
+sde_n: 1000
+sigma_min: 0.01
+sigma_max: 50.0
+continuous: true
+t_eps: 1e-5
+likelihood_weighting: true
+logit_transform: false
+use_ema: false
+ema_decay: 0.999
+
+sampling:
+  sampling:
+    method: pc
+    predictor: none
+    corrector: ald
+    snr: 0.128
+    n_steps_each: 1
+    probability_flow: false
+    noise_removal: false

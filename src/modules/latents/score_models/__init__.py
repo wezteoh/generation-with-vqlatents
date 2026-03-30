@@ -195,7 +195,7 @@ if __name__ == "__main__":
 
     from omegaconf import OmegaConf
 
-    from src.interfaces.dsm_latent import DSMLatentInterface
+    from src.interfaces.dsm import DSMLatentInterface
 
     _repo_root = Path(__file__).resolve().parents[4]
     _dsm_ckpt = os.environ.get(

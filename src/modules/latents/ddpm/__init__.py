@@ -1,4 +1,7 @@
-from src.modules.latents.ddpm.latent_openai_unet_ddpm import LatentOpenAIUNetDDPM
-from src.modules.latents.ddpm.raw_openai_unet_ddpm import RawOpenAIUNetDDPM
+from src.modules.latents.ddpm.openai_unet_ddpm import (
+    LatentOpenAIUNetDDPM,
+    OpenAIUNetDDPM,
+    RawOpenAIUNetDDPM,
+)
 
-__all__ = ["LatentOpenAIUNetDDPM", "RawOpenAIUNetDDPM"]
+__all__ = ["LatentOpenAIUNetDDPM", "OpenAIUNetDDPM", "RawOpenAIUNetDDPM"]

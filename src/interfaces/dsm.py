@@ -5,6 +5,7 @@ from typing import Any, Optional
 import pytorch_lightning as pl
 import torch
 
+from src.interfaces.transformer_latent import _load_vq_from_ckpt
 from src.modules.ema import LitEma
 from src.modules.latents.score_models import ScoreModel
 from src.modules.latents.score_models.cond_refinednet import LatentCondRefineNetScore
@@ -13,13 +14,11 @@ from src.modules.latents.score_models.unet import LatentUNetScore
 from src.modules.losses.score_matching import anneal_dsm_loss, dsm_loss
 
 
-class DSMRawInterface(pl.LightningModule):
-    """Lightning wrapper for denoising score matching on raw images (no first-stage VQ)."""
+class DSMInterface(pl.LightningModule):
+    """Denoising score matching on raw images or VQ latents."""
 
     def __init__(
         self,
-        in_channels: int,
-        image_size: int,
         min_sigma: float,
         max_sigma: float,
         num_sigmas: int,
@@ -32,15 +31,49 @@ class DSMRawInterface(pl.LightningModule):
         score_backbone: str = "unet",
         use_ema: bool = False,
         ema_decay: float = 0.999,
+        vq_ckpt_path: Optional[str] = None,
+        ddconfig: Optional[dict[str, Any]] = None,
+        n_embed: Optional[int] = None,
+        embed_dim: Optional[int] = None,
+        in_channels: Optional[int] = None,
+        image_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+
+        use_first_stage = (
+            vq_ckpt_path is not None and str(vq_ckpt_path).lower() != "null"
+        )
+        if use_first_stage:
+            if ddconfig is None or n_embed is None or embed_dim is None:
+                raise ValueError(
+                    "DSM latent requires ddconfig, n_embed, embed_dim, vq_ckpt_path"
+                )
+            first_stage = _load_vq_from_ckpt(
+                ddconfig=ddconfig,
+                n_embed=int(n_embed),
+                embed_dim=int(embed_dim),
+                ckpt_path=str(vq_ckpt_path),
+                image_key=image_key,
+            )
+            resolution = int(ddconfig.get("resolution", 32))
+            ch_mult = ddconfig.get("ch_mult", (1, 2, 4, 8))
+            num_resolutions = len(ch_mult)
+            latent_res = resolution // 2 ** (num_resolutions - 1)
+            ic = int(embed_dim)
+            sz = int(latent_res)
+            fs: Optional[torch.nn.Module] = first_stage
+        else:
+            if in_channels is None or image_size is None:
+                raise ValueError("DSM raw requires in_channels and image_size")
+            ic = int(in_channels)
+            sz = int(image_size)
+            fs = None
+
         self.image_key = image_key
         self.learning_rate = learning_rate
         self.anneal_power = anneal_power
         self.use_annealed_loss = use_annealed_loss
-        self.use_ema = bool(use_ema)
-        self.ema_decay = float(ema_decay)
         self._val_pass_count = 0
         self.val_logging_cfg = val_logging or {
             "enabled": True,
@@ -49,6 +82,9 @@ class DSMRawInterface(pl.LightningModule):
             "n_steps_each": 20,
             "step_lr": 2e-5,
         }
+
+        self.use_ema = bool(use_ema)
+        self.ema_decay = float(ema_decay)
 
         max_t = torch.as_tensor(max_sigma, dtype=torch.float32)
         min_t = torch.as_tensor(min_sigma, dtype=torch.float32)
@@ -60,38 +96,37 @@ class DSMRawInterface(pl.LightningModule):
         backbone: ScoreModel
         if score_backbone == "unet":
             backbone = LatentUNetScore(
-                in_channels=in_channels,
+                in_channels=ic,
                 base_channels=base_channels,
                 num_classes=int(num_sigmas),
-                first_stage_model=None,
-                image_size=int(image_size),
+                first_stage_model=fs,
+                image_size=sz,
                 logit_transform=False,
             )
         elif score_backbone == "cond_refinenet":
             backbone = LatentCondRefineNetScore(
-                in_channels=in_channels,
+                in_channels=ic,
                 base_channels=base_channels,
                 num_classes=int(num_sigmas),
-                first_stage_model=None,
-                image_size=int(image_size),
+                first_stage_model=fs,
+                image_size=sz,
                 logit_transform=False,
             )
         elif score_backbone == "ncsnv2":
             backbone = LatentNCSNv2Score(
-                in_channels=in_channels,
+                in_channels=ic,
                 base_channels=base_channels,
                 num_classes=int(num_sigmas),
-                first_stage_model=None,
-                image_size=int(image_size),
+                first_stage_model=fs,
+                image_size=sz,
                 logit_transform=False,
                 sigmas=self.sigmas,
             )
         else:
-            raise ValueError(f"Unsupported score_backbone for DSM raw: {score_backbone}")
+            raise ValueError(f"Unsupported score_backbone for DSM: {score_backbone}")
 
         self.model = backbone
 
-        # Optional EMA wrapper around the score model.
         if self.use_ema:
             if not (0.0 < self.ema_decay <= 1.0):
                 raise ValueError(f"EMA decay must be in (0, 1], got {self.ema_decay}")
@@ -99,11 +134,24 @@ class DSMRawInterface(pl.LightningModule):
         else:
             self.ema = None
 
+    @property
+    def use_first_stage(self) -> bool:
+        return self.model.first_stage_model is not None
+
     def forward(self, x: torch.Tensor, sigma_labels: torch.Tensor) -> torch.Tensor:
         return self.model(x, sigma_labels)
 
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
-        x = batch[self.image_key]
+        x_img = batch[self.image_key]
+        if self.use_first_stage:
+            fs = self.model.first_stage_model
+            assert fs is not None
+            with torch.no_grad():
+                latents, _, _ = fs.encode(x_img)
+            x = latents
+        else:
+            x = x_img
+
         b = x.shape[0]
         device = x.device
 
@@ -146,10 +194,14 @@ class DSMRawInterface(pl.LightningModule):
         )
         return loss
 
-    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def training_step(
+        self, batch: dict[str, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
         return self._shared_step(batch, stage="train")
 
-    def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def validation_step(
+        self, batch: dict[str, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
         is_sanity = getattr(self.trainer, "sanity_checking", False)
         if not is_sanity and batch_idx == 0:
             self._val_pass_count += 1
@@ -178,7 +230,9 @@ class DSMRawInterface(pl.LightningModule):
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure, *args, **kwargs)
+        super().optimizer_step(
+            epoch, batch_idx, optimizer, optimizer_closure, *args, **kwargs
+        )
         if self.ema is not None:
             self.ema(self.model)
 
@@ -210,34 +264,132 @@ class DSMRawInterface(pl.LightningModule):
         n = min(num_samples, x_img.shape[0])
         x_img = x_img[:n]
         device = x_img.device
-        image_shape = (
-            n,
-            self.hparams.in_channels,
-            self.hparams.image_size,
-            self.hparams.image_size,
-        )
 
-        sampled = self.model.sample_latents(
-            batch_size=n,
-            latent_shape=image_shape,
-            sigmas=self.sigmas.tolist(),
-            n_steps_each=n_steps_each_sigma,
-            step_lr=step_lr,
-            device=device,
-        )
+        if self.use_first_stage:
+            fs = self.model.first_stage_model
+            assert fs is not None
+            with torch.no_grad():
+                latents, _, _ = fs.encode(x_img)
+            latent_shape = latents.shape
+            sampled_latents = self.model.sample_latents(
+                batch_size=n,
+                latent_shape=latent_shape,
+                sigmas=self.sigmas.tolist(),
+                n_steps_each=n_steps_each_sigma,
+                step_lr=step_lr,
+                device=latents.device,
+            )
+            gen_tensor = self.model.quantize_and_decode(sampled_latents)
+        else:
+            image_shape = (
+                n,
+                int(self.hparams.in_channels),
+                int(self.hparams.image_size),
+                int(self.hparams.image_size),
+            )
+            gen_tensor = self.model.sample_latents(
+                batch_size=n,
+                latent_shape=image_shape,
+                sigmas=self.sigmas.tolist(),
+                n_steps_each=n_steps_each_sigma,
+                step_lr=step_lr,
+                device=device,
+            )
 
         orig = (x_img.detach().cpu().float() * 0.5 + 0.5).clamp(0, 1)
-        gen = (sampled.detach().cpu().float() * 0.5 + 0.5).clamp(0, 1)
+        gen = (gen_tensor.detach().cpu().float() * 0.5 + 0.5).clamp(0, 1)
         orig = (orig.permute(0, 2, 3, 1) * 255).round().to(torch.uint8)
         gen = (gen.permute(0, 2, 3, 1) * 255).round().to(torch.uint8)
         if orig.shape[-1] == 1:
             orig = orig.repeat(1, 1, 1, 3)
             gen = gen.repeat(1, 1, 1, 3)
 
-        images = [wandb.Image(orig[i].numpy(), caption=f"input {i}") for i in range(n)] + [
-            wandb.Image(gen[i].numpy(), caption=f"sample {i}") for i in range(n)
-        ]
+        images = [
+            wandb.Image(orig[i].numpy(), caption=f"input {i}") for i in range(n)
+        ] + [wandb.Image(gen[i].numpy(), caption=f"sample {i}") for i in range(n)]
         self.logger.experiment.log(
             {"val/dsm_samples": images},
             step=self.global_step,
+        )
+
+
+class DSMRawInterface(DSMInterface):
+    def __init__(
+        self,
+        in_channels: int,
+        image_size: int,
+        min_sigma: float,
+        max_sigma: float,
+        num_sigmas: int,
+        base_channels: int = 64,
+        image_key: str = "image",
+        learning_rate: float = 2e-4,
+        anneal_power: float = 2.0,
+        use_annealed_loss: bool = True,
+        val_logging: Optional[dict[str, Any]] = None,
+        score_backbone: str = "unet",
+        use_ema: bool = False,
+        ema_decay: float = 0.999,
+    ) -> None:
+        super().__init__(
+            min_sigma=min_sigma,
+            max_sigma=max_sigma,
+            num_sigmas=num_sigmas,
+            base_channels=base_channels,
+            image_key=image_key,
+            learning_rate=learning_rate,
+            anneal_power=anneal_power,
+            use_annealed_loss=use_annealed_loss,
+            val_logging=val_logging,
+            score_backbone=score_backbone,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
+            vq_ckpt_path=None,
+            ddconfig=None,
+            n_embed=None,
+            embed_dim=None,
+            in_channels=in_channels,
+            image_size=image_size,
+        )
+
+
+class DSMLatentInterface(DSMInterface):
+    def __init__(
+        self,
+        ddconfig: dict[str, Any],
+        n_embed: int,
+        embed_dim: int,
+        vq_ckpt_path: str,
+        min_sigma: float,
+        max_sigma: float,
+        num_sigmas: int,
+        base_channels: int = 64,
+        image_key: str = "image",
+        learning_rate: float = 2e-4,
+        anneal_power: float = 2.0,
+        use_annealed_loss: bool = True,
+        val_logging: Optional[dict[str, Any]] = None,
+        score_backbone: str = "unet",
+        use_ema: bool = False,
+        ema_decay: float = 0.999,
+    ) -> None:
+        super().__init__(
+            min_sigma=min_sigma,
+            max_sigma=max_sigma,
+            num_sigmas=num_sigmas,
+            base_channels=base_channels,
+            image_key=image_key,
+            learning_rate=learning_rate,
+            anneal_power=anneal_power,
+            use_annealed_loss=use_annealed_loss,
+            val_logging=val_logging,
+            score_backbone=score_backbone,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
+            vq_ckpt_path=vq_ckpt_path,
+            ddconfig=ddconfig,
+            n_embed=n_embed,
+            embed_dim=embed_dim,
+            in_channels=None,
+            image_size=None,
         )

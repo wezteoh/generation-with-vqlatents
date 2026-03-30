@@ -1,4 +1,4 @@
-"""Optional validation Fréchet distance between real val images and DDPM samples."""
+"""Optional validation Fréchet distance between real val images and model samples."""
 
 from __future__ import annotations
 
@@ -24,8 +24,9 @@ def run_sample_fid_if_gated(
     """If `sample_fid` is enabled and the frequency gate matches, log `val/sample_fid`.
 
     Reals: one pass over `val_dataloader` up to `num_real_samples`.
-    Fakes: `generate_fake_images` in chunks until `num_gen_samples`. Caller runs DDPM
-    sampling; this helper wraps fake generation with EMA store/copy/restore.
+    Fakes: `generate_fake_images` in chunks until `num_gen_samples`. The caller supplies
+    sampling or decoding; this helper wraps fake generation with EMA store/copy/restore
+    when `ema` is not None.
     """
     trainer = module.trainer
     if getattr(trainer, "sanity_checking", False):

@@ -1,0 +1,15 @@
+# Canonical DSM: raw if `vq_ckpt_path` is null/absent; latent if set.
+name: dsm
+
+vq_ckpt_path: null
+
+base_channels: 32
+min_sigma: 0.01
+max_sigma: 1.0
+num_sigmas: 10
+
+anneal_power: 2.0
+use_annealed_loss: true
+score_backbone: unet
+use_ema: true
+ema_decay: 0.999

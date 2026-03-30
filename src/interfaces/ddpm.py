@@ -8,24 +8,20 @@ import torch.nn.functional as F
 from einops import rearrange
 from pytorch_lightning.loggers import WandbLogger
 
-from src.interfaces.ddpm_sample_fid import run_sample_fid_if_gated
+from src.utils.sample_fid import run_sample_fid_if_gated
 from src.interfaces.transformer_latent import _load_vq_from_ckpt
 from src.modules.ema import LitEma
-from src.modules.latents.ddpm import LatentOpenAIUNetDDPM
+from src.modules.latents.ddpm import OpenAIUNetDDPM
 from src.utils.wandb_comparison import build_side_by_side_wandb_images
 
 ConditioningMode = Literal["none", "class", "context"]
 
 
-class DDPMLatentInterface(pl.LightningModule):
-    """DDPM training on VQ latents using an OpenAI-style UNet backbone."""
+class DDPMInterface(pl.LightningModule):
+    """DDPM on raw pixels or VQ latents (OpenAI UNet); first-stage VQ selects mode."""
 
     def __init__(
         self,
-        ddconfig: dict[str, Any],
-        n_embed: int,
-        embed_dim: int,
-        vq_ckpt_path: str,
         image_key: str = "image",
         learning_rate: float = 1e-4,
         timesteps: int = 1000,
@@ -42,7 +38,7 @@ class DDPMLatentInterface(pl.LightningModule):
         attention_resolutions: Optional[tuple[int, ...]] = None,
         channel_mult: tuple[int, ...] = (1, 2, 4, 8),
         dropout: float = 0.0,
-        logit_transform: bool = True,
+        logit_transform: bool = False,
         use_ema: bool = False,
         ema_decay: float = 0.999,
         val_logging: Optional[dict[str, Any]] = None,
@@ -54,9 +50,45 @@ class DDPMLatentInterface(pl.LightningModule):
         unconditional_prob: float = 0.0,
         context_dim: Optional[int] = None,
         transformer_depth: int = 1,
+        vq_ckpt_path: Optional[str] = None,
+        ddconfig: Optional[dict[str, Any]] = None,
+        n_embed: Optional[int] = None,
+        embed_dim: Optional[int] = None,
+        in_channels: Optional[int] = None,
+        image_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
+
+        use_first_stage = (
+            vq_ckpt_path is not None and str(vq_ckpt_path).lower() != "null"
+        )
+        if use_first_stage:
+            if ddconfig is None or n_embed is None or embed_dim is None:
+                raise ValueError(
+                    "Latent DDPM requires ddconfig, n_embed, embed_dim, vq_ckpt_path"
+                )
+            first_stage = _load_vq_from_ckpt(
+                ddconfig=ddconfig,
+                n_embed=int(n_embed),
+                embed_dim=int(embed_dim),
+                ckpt_path=str(vq_ckpt_path),
+                image_key=image_key,
+            )
+            resolution = int(ddconfig.get("resolution", 32))
+            ch_mult_cfg = ddconfig.get("ch_mult", (1, 2, 4, 8))
+            num_resolutions = len(ch_mult_cfg)
+            latent_res = resolution // 2 ** (num_resolutions - 1)
+            unet_in = int(embed_dim)
+            unet_size = int(latent_res)
+            first_mod: Optional[torch.nn.Module] = first_stage
+        else:
+            if in_channels is None or image_size is None:
+                raise ValueError("Raw DDPM requires in_channels and image_size")
+            unet_in = int(in_channels)
+            unet_size = int(image_size)
+            first_mod = None
+
         self.image_key = image_key
         self.learning_rate = float(learning_rate)
         self.parameterization = str(parameterization)
@@ -83,23 +115,13 @@ class DDPMLatentInterface(pl.LightningModule):
         if sampling_cfg is not None:
             self.sampling_cfg = {**default_sampling_cfg, **sampling_cfg}
 
-        first_stage = _load_vq_from_ckpt(
-            ddconfig=ddconfig,
-            n_embed=n_embed,
-            embed_dim=embed_dim,
-            ckpt_path=vq_ckpt_path,
-            image_key=image_key,
-        )
-
-        resolution = int(ddconfig.get("resolution", 32))
-        ch_mult_cfg = ddconfig.get("ch_mult", (1, 2, 4, 8))
-        num_resolutions = len(ch_mult_cfg)
-        latent_res = resolution // 2 ** (num_resolutions - 1)
+        att_res = attention_resolutions
+        ch_mult_t = channel_mult
 
         model_kw: dict[str, Any] = dict(
-            first_stage_model=first_stage,
-            in_channels=int(embed_dim),
-            image_size=int(latent_res),
+            in_channels=unet_in,
+            image_size=unet_size,
+            first_stage_model=first_mod,
             num_timesteps=int(timesteps),
             beta_schedule=str(beta_schedule),
             linear_start=float(linear_start),
@@ -108,8 +130,8 @@ class DDPMLatentInterface(pl.LightningModule):
             parameterization=self.parameterization,
             model_channels=int(base_channels),
             num_res_blocks=int(num_res_blocks),
-            attention_resolutions=attention_resolutions,
-            channel_mult=channel_mult,
+            attention_resolutions=att_res,
+            channel_mult=ch_mult_t,
             dropout=float(dropout),
             logit_transform=bool(logit_transform),
             conditioning_mode=conditioning_mode,
@@ -128,7 +150,7 @@ class DDPMLatentInterface(pl.LightningModule):
                 )
             model_kw["context_dim"] = int(context_dim)
 
-        self.model = LatentOpenAIUNetDDPM(**model_kw)
+        self.model = OpenAIUNetDDPM(**model_kw)
 
         if bool(use_ema):
             if not (0.0 < float(ema_decay) <= 1.0):
@@ -136,6 +158,10 @@ class DDPMLatentInterface(pl.LightningModule):
             self.ema = LitEma(self.model, decay=float(ema_decay))
         else:
             self.ema = None
+
+    @property
+    def use_first_stage(self) -> bool:
+        return self.model.first_stage_model is not None
 
     def forward(
         self,
@@ -215,10 +241,15 @@ class DDPMLatentInterface(pl.LightningModule):
 
     def _shared_step(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         x_img = batch[self.image_key]
-        with torch.no_grad():
-            latents, _, _ = self.model.first_stage_model.encode(x_img)
+        if self.use_first_stage:
+            fs = self.model.first_stage_model
+            assert fs is not None
+            with torch.no_grad():
+                latents, _, _ = fs.encode(x_img)
+            x0 = latents
+        else:
+            x0 = x_img
 
-        x0 = latents
         b = x0.shape[0]
         device = x0.device
 
@@ -308,7 +339,9 @@ class DDPMLatentInterface(pl.LightningModule):
                 context=None,
                 guidance_scale=1.0,
             )
-            return self.model.quantize_and_decode(lat)
+            if self.use_first_stage:
+                return self.model.quantize_and_decode(lat)
+            return lat
 
         run_sample_fid_if_gated(
             self,
@@ -356,16 +389,28 @@ class DDPMLatentInterface(pl.LightningModule):
         x_img = batch[self.image_key]
         n = min(num_samples, x_img.shape[0])
         x_img = x_img[:n]
-        with torch.no_grad():
-            latents, _, _ = self.model.first_stage_model.encode(x_img)
-
-        latent_shape = latents.shape
+        device = x_img.device
+        c = self.model.in_channels
+        h = w = self.model.image_size
+        sample_shape = (n, c, h, w)
         clip = bool(self.sampling_cfg.get("clip_denoised", False))
         g_scale = float(self.sampling_cfg.get("guidance_scale", 1.0))
-        device = latents.device
+
+        if self.use_first_stage:
+            fs = self.model.first_stage_model
+            assert fs is not None
+            with torch.no_grad():
+                latents, _, _ = fs.encode(x_img)
+            latent_shape = latents.shape
+        else:
+            latent_shape = sample_shape
+
+        log_key = (
+            "val/ddpm_raw_samples" if not self.use_first_stage else "val/ddpm_samples"
+        )
 
         if self.conditioning_mode == "none":
-            sampled_latents = self.model.sample_latents(
+            sampled = self.model.sample_latents(
                 batch_size=n,
                 latent_shape=latent_shape,
                 device=device,
@@ -374,9 +419,12 @@ class DDPMLatentInterface(pl.LightningModule):
                 context=None,
                 guidance_scale=1.0,
             )
-            decoded = self.model.quantize_and_decode(sampled_latents)
+            if self.use_first_stage:
+                gen_tensor = self.model.quantize_and_decode(sampled)
+            else:
+                gen_tensor = sampled
             orig = (x_img.detach().cpu().float() * 0.5 + 0.5).clamp(0, 1)
-            gen = (decoded.detach().cpu().float() * 0.5 + 0.5).clamp(0, 1)
+            gen = (gen_tensor.detach().cpu().float() * 0.5 + 0.5).clamp(0, 1)
             orig = (orig.permute(0, 2, 3, 1) * 255).round().to(torch.uint8)
             gen = (gen.permute(0, 2, 3, 1) * 255).round().to(torch.uint8)
             if orig.shape[-1] == 1:
@@ -387,7 +435,7 @@ class DDPMLatentInterface(pl.LightningModule):
             ] + [wandb.Image(gen[i].numpy(), caption=f"sample {i}") for i in range(n)]
         elif self.conditioning_mode == "class":
             y = batch[self.label_key][:n].long().to(device)
-            sampled_latents = self.model.sample_latents(
+            sampled = self.model.sample_latents(
                 batch_size=n,
                 latent_shape=latent_shape,
                 device=device,
@@ -396,14 +444,19 @@ class DDPMLatentInterface(pl.LightningModule):
                 context=None,
                 guidance_scale=g_scale,
             )
-            decoded = self.model.quantize_and_decode(sampled_latents)
+            if self.use_first_stage:
+                gen_tensor = self.model.quantize_and_decode(sampled)
+            else:
+                gen_tensor = sampled
             lbl = batch[self.label_key][:n].long().cpu().tolist()
             captions = [f"real | gen (label {lbl[i]}) [{i}]" for i in range(n)]
-            images = build_side_by_side_wandb_images(x_img, decoded, captions=captions)
+            images = build_side_by_side_wandb_images(
+                x_img, gen_tensor, captions=captions
+            )
         else:
             ctx_map = batch[self.context_key][:n].to(device)
             context = rearrange(ctx_map, "b c h w -> b (h w) c")
-            sampled_latents = self.model.sample_latents(
+            sampled = self.model.sample_latents(
                 batch_size=n,
                 latent_shape=latent_shape,
                 device=device,
@@ -412,11 +465,166 @@ class DDPMLatentInterface(pl.LightningModule):
                 context=context,
                 guidance_scale=g_scale,
             )
-            decoded = self.model.quantize_and_decode(sampled_latents)
+            if self.use_first_stage:
+                gen_tensor = self.model.quantize_and_decode(sampled)
+            else:
+                gen_tensor = sampled
             captions = [f"real | gen (context) [{i}]" for i in range(n)]
-            images = build_side_by_side_wandb_images(x_img, decoded, captions=captions)
+            images = build_side_by_side_wandb_images(
+                x_img, gen_tensor, captions=captions
+            )
 
         self.logger.experiment.log(
-            {"val/ddpm_samples": images},
+            {log_key: images},
             step=self.global_step,
+        )
+
+
+class DDPMRawInterface(DDPMInterface):
+    """Raw-pixel DDPM; thin wrapper for `load_from_checkpoint` compatibility."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        image_size: int,
+        image_key: str = "image",
+        learning_rate: float = 1e-4,
+        timesteps: int = 1000,
+        beta_schedule: str = "linear",
+        linear_start: float = 1e-4,
+        linear_end: float = 2e-2,
+        cosine_s: float = 8e-3,
+        parameterization: str = "eps",
+        loss_type: str = "l2",
+        l_simple_weight: float = 1.0,
+        original_elbo_weight: float = 0.0,
+        base_channels: int = 64,
+        num_res_blocks: int = 2,
+        attention_resolutions: Optional[tuple[int, ...]] = None,
+        channel_mult: tuple[int, ...] = (1, 2, 4, 8),
+        dropout: float = 0.0,
+        logit_transform: bool = False,
+        use_ema: bool = False,
+        ema_decay: float = 0.999,
+        val_logging: Optional[dict[str, Any]] = None,
+        sampling_cfg: Optional[dict[str, Any]] = None,
+        conditioning_mode: ConditioningMode = "none",
+        num_data_classes: Optional[int] = None,
+        label_key: str = "label",
+        context_key: str = "context",
+        unconditional_prob: float = 0.0,
+        context_dim: Optional[int] = None,
+        transformer_depth: int = 1,
+    ) -> None:
+        super().__init__(
+            image_key=image_key,
+            learning_rate=learning_rate,
+            timesteps=timesteps,
+            beta_schedule=beta_schedule,
+            linear_start=linear_start,
+            linear_end=linear_end,
+            cosine_s=cosine_s,
+            parameterization=parameterization,
+            loss_type=loss_type,
+            l_simple_weight=l_simple_weight,
+            original_elbo_weight=original_elbo_weight,
+            base_channels=base_channels,
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=attention_resolutions,
+            channel_mult=channel_mult,
+            dropout=dropout,
+            logit_transform=logit_transform,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
+            val_logging=val_logging,
+            sampling_cfg=sampling_cfg,
+            conditioning_mode=conditioning_mode,
+            num_data_classes=num_data_classes,
+            label_key=label_key,
+            context_key=context_key,
+            unconditional_prob=unconditional_prob,
+            context_dim=context_dim,
+            transformer_depth=transformer_depth,
+            vq_ckpt_path=None,
+            ddconfig=None,
+            n_embed=None,
+            embed_dim=None,
+            in_channels=in_channels,
+            image_size=image_size,
+        )
+
+
+class DDPMLatentInterface(DDPMInterface):
+    """Latent DDPM; thin wrapper for `load_from_checkpoint` compatibility."""
+
+    def __init__(
+        self,
+        ddconfig: dict[str, Any],
+        n_embed: int,
+        embed_dim: int,
+        vq_ckpt_path: str,
+        image_key: str = "image",
+        learning_rate: float = 1e-4,
+        timesteps: int = 1000,
+        beta_schedule: str = "linear",
+        linear_start: float = 1e-4,
+        linear_end: float = 2e-2,
+        cosine_s: float = 8e-3,
+        parameterization: str = "eps",
+        loss_type: str = "l2",
+        l_simple_weight: float = 1.0,
+        original_elbo_weight: float = 0.0,
+        base_channels: int = 64,
+        num_res_blocks: int = 2,
+        attention_resolutions: Optional[tuple[int, ...]] = None,
+        channel_mult: tuple[int, ...] = (1, 2, 4, 8),
+        dropout: float = 0.0,
+        logit_transform: bool = True,
+        use_ema: bool = False,
+        ema_decay: float = 0.999,
+        val_logging: Optional[dict[str, Any]] = None,
+        sampling_cfg: Optional[dict[str, Any]] = None,
+        conditioning_mode: ConditioningMode = "none",
+        num_data_classes: Optional[int] = None,
+        label_key: str = "label",
+        context_key: str = "context",
+        unconditional_prob: float = 0.0,
+        context_dim: Optional[int] = None,
+        transformer_depth: int = 1,
+    ) -> None:
+        super().__init__(
+            image_key=image_key,
+            learning_rate=learning_rate,
+            timesteps=timesteps,
+            beta_schedule=beta_schedule,
+            linear_start=linear_start,
+            linear_end=linear_end,
+            cosine_s=cosine_s,
+            parameterization=parameterization,
+            loss_type=loss_type,
+            l_simple_weight=l_simple_weight,
+            original_elbo_weight=original_elbo_weight,
+            base_channels=base_channels,
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=attention_resolutions,
+            channel_mult=channel_mult,
+            dropout=dropout,
+            logit_transform=logit_transform,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
+            val_logging=val_logging,
+            sampling_cfg=sampling_cfg,
+            conditioning_mode=conditioning_mode,
+            num_data_classes=num_data_classes,
+            label_key=label_key,
+            context_key=context_key,
+            unconditional_prob=unconditional_prob,
+            context_dim=context_dim,
+            transformer_depth=transformer_depth,
+            vq_ckpt_path=vq_ckpt_path,
+            ddconfig=ddconfig,
+            n_embed=n_embed,
+            embed_dim=embed_dim,
+            in_channels=None,
+            image_size=None,
         )

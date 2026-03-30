@@ -11,7 +11,7 @@ PyTorch (Lightning) + Hydra codebase for generative models built on vector-quant
   - **Score SDE** (NCSNv2-style): latent and raw (`train_mnist_score_sde_ncsnv2_*`)
   - **DDPM:** raw-pixel and latent diffusion with OpenAI-style UNets; optional class or context conditioning via `model.conditioning` in configs. Optional validation FID when `trainer.val_logging.sample_fid` is enabled (helper in `src/interfaces/ddpm_sample_fid.py`)
 
-`train.py` dispatches on `model.name`: `vqvae`, `vqgan`, `transformer_prior`, `dsm_latent`, `dsm_raw`, `ddpm_latent`, `ddpm_raw`, `score_sde_latent`, `score_sde_raw`.
+`train.py` dispatches on `model.name`: `vqvae`, `vqgan`, `transformer_prior`, and **`ddpm` / `dsm` / `score_sde`** (latent vs raw from optional `model.vq_ckpt_path`) plus legacy aliases `ddpm_latent`, `ddpm_raw`, `dsm_latent`, `dsm_raw`, `score_sde_latent`, `score_sde_raw`.
 
 ## Project structure
 
@@ -21,7 +21,7 @@ PyTorch (Lightning) + Hydra codebase for generative models built on vector-quant
 | **`configs/`** | Hydra YAML. Top-level `train_*.yaml` files set data, model, trainer, and W&B. Model fragments live under `configs/model/`. |
 | **`src/data/`** | Datamodules: `mnist.py` (MNIST), labeled MNIST (`MNISTLabeledDataModule`), `imagenet.py`, `celebahq.py` (CelebA-HQ 256), plus `base.py`. |
 | **`src/modules/`** | `nn.Module` building blocks: `autoencoders/`, `quantizers/`, `latents/` (`ddpm/`, `score_models/`, `score_sde/`, `diffusion_backbones/`, `autoregressives/`), `losses/` (including `ddpm.py`, score matching, VAE, GAN), `discriminators/`, `perceptual/`, `shared/`. |
-| **`src/interfaces/`** | Lightning modules per task: `vqvae.py`, `vqgan.py`, `transformer_latent.py`, `dsm_raw.py`, `dsm_latent.py`, `ddpm_raw.py`, `ddpm_latent.py`, `score_sde_raw.py`, `score_sde_latent.py`; `ddpm_sample_fid.py` implements optional val FID for DDPM. |
+| **`src/interfaces/`** | Lightning modules: `vqvae.py`, `vqgan.py`, `transformer_latent.py`, `ddpm.py`, `dsm.py`, `score_sde.py`; `ddpm_sample_fid.py` for optional val FID. Resume or infer with `*Interface.load_from_checkpoint` using classes imported from these modules. |
 
 Training is wired by config: the chosen `train_*.yaml` sets `model.name`, which selects the interface in `train.py` and the matching `configs/model/*.yaml` fragment.
 
