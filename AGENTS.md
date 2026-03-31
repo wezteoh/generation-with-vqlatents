@@ -6,14 +6,14 @@ This project involves developing Machine Learning models using Python. The agent
 *   **Dependency Management:** Use `uv` for dependency management. Ensure `pyproject.toml` is updated with required packages.
 
 ## Code Style
-*   **Linting:** Adhere to `flake8` and `black` style guidelines.
+*   **Linting:** Adhere to `flake8` and `black` style guidelines with max line length 88.
 *   **Tensor manipulation:** favor using `einops` for any tensor transformation or multiplication for readability.
 
 ## ML-Specific Methodology
 *   **Experiment Tracking:** Use `wandb` for versioning, tracking experiments.
 *   **Data Handling:**
     *   Treat the operational environment with the utmost respect. Never hardcode data paths or credentials.
-*   **Model Versioning:** Save all trained models in checkpoint folders with associated experiment IDs. Keep a config.yaml within the folder which contains required information to reinstantiate the model for loading during inference.
+*   **Model Versioning:** Save all trained models in checkpoint folders with associated experiment IDs, and the experiment folders should be grouped under directory named after the wandb project name. Keep a config.yaml within each folder which contains required information to reinstantiate the model for loading during inference.
 
 ## Development
 *   **Code Structure:** Develop based on the structure below

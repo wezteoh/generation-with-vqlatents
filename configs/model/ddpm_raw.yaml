@@ -25,10 +25,18 @@ use_ema: false
 ema_decay: 0.999
 
 # Optional: classifier-free guidance at sampling (`guidance_scale` > 1 needs `unconditional_prob` > 0 during training).
+# Validation / FID fake images use `model.sampling` for `sample_latents` (default: full ancestral DDPM).
 # Example:
 # sampling:
 #   clip_denoised: false
 #   guidance_scale: 3.0
+#   method: ancestral_sampling   # or dpmsolver / dpm_solver
+#   dpmsolver_steps: 20
+#   dpmsolver_order: 3
+#   dpmsolver_inner_method: singlestep   # singlestep | multistep | singlestep_fixed | adaptive
+#   dpmsolver_skip_type: time_uniform    # time_uniform | logSNR | time_quadratic
+#   dpmsolver_algorithm_type: dpmsolver++
+#   dpmsolver_denoise_to_zero: false
 #
 # Optional class/context conditioning:
 # conditioning:
@@ -36,6 +44,28 @@ ema_decay: 0.999
 #   num_classes: 10
 #   label_key: label
 #   unconditional_prob: 0.1
-# For context mode also set: context_dim, context_key; optional transformer_depth: 1
+#
+# Context mode (cross-attention, default):
+#   mode: context
+#   context_key: context
+#   context_dim: 128          # last dim after encoder; must match encoder out channels
+#   context_apply: cross_attention
+#   unconditional_prob: 0.1
+#   context_encoder:          # omit or type: identity for raw BCHW already at UNet resolution
+#     type: spatial_rescaler
+#     n_stages: 1
+#     multiplier: 0.5
+#     method: bilinear
+#     in_channels: 1
+#     out_channels: 128
+#     bias: false
+#   encoder_trainable: true
+#
+# Context mode (concat at UNet input; backbone in_ch = latent_ch + cond_channels):
+#   mode: context
+#   context_apply: concat
+#   cond_channels: 64
+#   context_encoder: { ... }   # output spatial size must equal UNet image_size
+# Datamodules must set _unconditional_context_tensor in setup() (shape 1xCxHxW) for CFG.
 
 sampling: null

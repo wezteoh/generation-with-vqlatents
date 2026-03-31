@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 
 import torch
 from pytorch_lightning import LightningModule
+from tqdm.auto import tqdm
 
 from src.modules.ema import LitEma
 from src.utils.fid_inputs import tensor_to_fid_input
@@ -92,10 +93,12 @@ def run_sample_fid_if_gated(
         ema.store(model.parameters())
         ema.copy_to(model)
     try:
-        while gen_left > 0:
-            bs = min(gen_bs, gen_left)
-            fake_parts.append(generate_fake_images(bs, device))
-            gen_left -= bs
+        with tqdm(total=num_gen, desc="FID: generate samples", unit="img") as pbar:
+            while gen_left > 0:
+                bs = min(gen_bs, gen_left)
+                fake_parts.append(generate_fake_images(bs, device))
+                pbar.update(bs)
+                gen_left -= bs
     finally:
         if ema is not None:
             ema.restore(model.parameters())

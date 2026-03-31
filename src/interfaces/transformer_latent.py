@@ -12,6 +12,10 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from src.modules.autoencoders import VQAutoencoder
 from src.modules.latents import LatentTransformer
+from src.utils.latent_first_stage_ckpt import (
+    check_strict_first_stage_load,
+    omit_first_stage_keys,
+)
 
 
 def _load_vq_from_ckpt(
@@ -34,7 +38,9 @@ def _load_vq_from_ckpt(
     # If checkpoint is from VQVAEInterface, weights live under "model."
     if any(k.startswith("model.") for k in state_dict):
         state_dict = {
-            k.replace("model.", ""): v for k, v in state_dict.items() if k.startswith("model.")
+            k.replace("model.", ""): v
+            for k, v in state_dict.items()
+            if k.startswith("model.")
         }
     vq.load_state_dict(state_dict, strict=True)
     return vq
@@ -100,6 +106,22 @@ class TransformerLatentInterface(pl.LightningModule):
             pkeep=pkeep,
             sos_token=sos_token,
         )
+
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        o = super().state_dict(*args, **kwargs)
+        return omit_first_stage_keys(o)
+
+    def load_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        strict: bool = True,
+        assign: bool = False,
+    ) -> Any:
+        filtered = omit_first_stage_keys(state_dict)
+        incomp = super().load_state_dict(filtered, strict=False, assign=assign)
+        if strict:
+            check_strict_first_stage_load(incomp)
+        return incomp
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model(x)
@@ -183,9 +205,9 @@ class TransformerLatentInterface(pl.LightningModule):
         if orig.shape[-1] == 1:
             orig = orig.repeat(1, 1, 1, 3)
             gen = gen.repeat(1, 1, 1, 3)
-        images = [wandb.Image(orig[i].numpy(), caption=f"input {i}") for i in range(n)] + [
-            wandb.Image(gen[i].numpy(), caption=f"sample {i}") for i in range(n)
-        ]
+        images = [
+            wandb.Image(orig[i].numpy(), caption=f"input {i}") for i in range(n)
+        ] + [wandb.Image(gen[i].numpy(), caption=f"sample {i}") for i in range(n)]
         self.logger.experiment.log(
             {"val/prior_samples": images},
             step=self.global_step,
@@ -218,7 +240,9 @@ class TransformerLatentInterface(pl.LightningModule):
             },
         ]
 
-        optimizer = torch.optim.AdamW(optim_groups, lr=self.learning_rate, betas=self.betas)
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=self.learning_rate, betas=self.betas
+        )
 
         if self.scheduler_cfg.get("name", "warmup_cosine") != "warmup_cosine":
             return optimizer
@@ -235,7 +259,9 @@ class TransformerLatentInterface(pl.LightningModule):
             if current_step < capped_warmup:
                 return float(current_step + 1) / float(capped_warmup)
 
-            progress = (current_step - capped_warmup) / float(total_steps - capped_warmup)
+            progress = (current_step - capped_warmup) / float(
+                total_steps - capped_warmup
+            )
             progress = min(max(progress, 0.0), 1.0)
             cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
             return min_lr_ratio + (1.0 - min_lr_ratio) * cosine

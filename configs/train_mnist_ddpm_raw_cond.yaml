@@ -53,6 +53,7 @@ model:
   sampling:
     clip_denoised: false
     guidance_scale: 3.0
+    # method: ancestral_sampling  # or dpmsolver for faster val samples (see model/ddpm_raw.yaml)
 
 hydra:
   run:

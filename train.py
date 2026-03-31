@@ -9,12 +9,12 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
-from src.data.celebahq import CelebAHQ256DataModule
+from src.data.celebahq import CelebAHQ256DataModule, CelebAHQ256EdgesDataModule
 from src.data.imagenet import ImageNetDataModule
 from src.data.mnist import MNISTDataModule, MNISTLabeledDataModule
-from src.interfaces.ddpm import DDPMLatentInterface, DDPMRawInterface
-from src.interfaces.dsm import DSMLatentInterface, DSMRawInterface
-from src.interfaces.score_sde import ScoreSDEInterface, ScoreSDERawInterface
+from src.interfaces.ddpm import DDPMInterface
+from src.interfaces.dsm import DSMInterface
+from src.interfaces.score_sde import ScoreSDEBase
 from src.utils.vqvae_ckpt import load_vqvae_meta_from_ckpt_path
 from src.interfaces.transformer_latent import TransformerLatentInterface
 from src.interfaces.vqgan import VQGANInterface
@@ -31,6 +31,8 @@ def _build_datamodule(data_cfg: DictConfig) -> Any:
         return ImageNetDataModule(**params)
     if data_cfg.name == "celebahq256":
         return CelebAHQ256DataModule(**params)
+    if data_cfg.name == "celebahq256_edges":
+        return CelebAHQ256EdgesDataModule(**params)
     raise ValueError(f"Unsupported dataset: {data_cfg.name}")
 
 
@@ -45,15 +47,29 @@ def _ddpm_conditioning_kwargs(model_cfg: dict[str, Any]) -> dict[str, Any]:
             "context_key": "context",
             "unconditional_prob": 0.0,
             "context_dim": None,
+            "context_apply": "cross_attention",
+            "cond_channels": None,
+            "context_encoder_cfg": None,
+            "encoder_trainable": True,
             "transformer_depth": 1,
         }
     mode = str(cond.get("mode", "none"))
+    enc_raw = cond.get("context_encoder")
+    if enc_raw is None:
+        enc_cfg = None
+    elif OmegaConf.is_config(enc_raw):
+        enc_cfg = OmegaConf.to_container(enc_raw, resolve=True)
+    else:
+        enc_cfg = dict(enc_raw)
     out: dict[str, Any] = {
         "conditioning_mode": mode,
         "label_key": str(cond.get("label_key", "label")),
         "context_key": str(cond.get("context_key", "context")),
         "unconditional_prob": float(cond.get("unconditional_prob", 0.0)),
         "transformer_depth": int(cond.get("transformer_depth", 1)),
+        "context_apply": str(cond.get("context_apply", "cross_attention")),
+        "context_encoder_cfg": enc_cfg,
+        "encoder_trainable": bool(cond.get("encoder_trainable", True)),
     }
     if mode == "class":
         if "num_classes" not in cond:
@@ -62,16 +78,35 @@ def _ddpm_conditioning_kwargs(model_cfg: dict[str, Any]) -> dict[str, Any]:
             )
         out["num_data_classes"] = int(cond["num_classes"])
         out["context_dim"] = None
+        out["cond_channels"] = None
     elif mode == "context":
-        if "context_dim" not in cond:
+        apply = out["context_apply"]
+        if apply == "cross_attention":
+            if "context_dim" not in cond:
+                raise ValueError(
+                    "model.conditioning.context_dim is required when mode is "
+                    "'context' and context_apply is 'cross_attention'"
+                )
+            out["context_dim"] = int(cond["context_dim"])
+            out["cond_channels"] = None
+        elif apply == "concat":
+            if "cond_channels" not in cond:
+                raise ValueError(
+                    "model.conditioning.cond_channels is required when mode is "
+                    "'context' and context_apply is 'concat'"
+                )
+            out["cond_channels"] = int(cond["cond_channels"])
+            out["context_dim"] = None
+        else:
             raise ValueError(
-                "model.conditioning.context_dim is required when mode is 'context'"
+                f"model.conditioning.context_apply must be 'cross_attention' or "
+                f"'concat', got {apply!r}"
             )
-        out["context_dim"] = int(cond["context_dim"])
         out["num_data_classes"] = None
     else:
         out["num_data_classes"] = None
         out["context_dim"] = None
+        out["cond_channels"] = None
     return out
 
 
@@ -226,6 +261,20 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             cfg.trainer.val_logging, resolve=True
         )
         want_latent = _dsm_wants_latent(model_name, model_cfg)
+        dsm_kw: dict[str, Any] = {
+            "min_sigma": float(model_cfg.get("min_sigma", 0.01)),
+            "max_sigma": float(model_cfg.get("max_sigma", 0.2)),
+            "num_sigmas": int(model_cfg.get("num_sigmas", 4)),
+            "base_channels": int(model_cfg.get("base_channels", 64)),
+            "image_key": image_key,
+            "learning_rate": float(trainer_optim["learning_rate"]),
+            "anneal_power": float(model_cfg.get("anneal_power", 2.0)),
+            "use_annealed_loss": bool(model_cfg.get("use_annealed_loss", True)),
+            "val_logging": trainer_val_logging,
+            "score_backbone": str(model_cfg.get("score_backbone", "unet")),
+            "use_ema": bool(model_cfg.get("use_ema", True)),
+            "ema_decay": float(model_cfg.get("ema_decay", 0.999)),
+        }
         if want_latent:
             if not _vq_path_configured(model_cfg):
                 raise ValueError(
@@ -244,41 +293,22 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
                 raise ValueError(
                     f"{model_name}.embed_dim does not match VQ-VAE config embed_dim"
                 )
-            return DSMLatentInterface(
+            dsm_kw.update(
                 ddconfig=vq_ddconfig,
                 n_embed=vq_n_embed,
                 embed_dim=vq_embed_dim,
                 vq_ckpt_path=vq_ckpt,
-                min_sigma=float(model_cfg.get("min_sigma", 0.01)),
-                max_sigma=float(model_cfg.get("max_sigma", 0.2)),
-                num_sigmas=int(model_cfg.get("num_sigmas", 4)),
-                base_channels=int(model_cfg.get("base_channels", 64)),
-                image_key=image_key,
-                learning_rate=float(trainer_optim["learning_rate"]),
-                anneal_power=float(model_cfg.get("anneal_power", 2.0)),
-                use_annealed_loss=bool(model_cfg.get("use_annealed_loss", True)),
-                val_logging=trainer_val_logging,
-                score_backbone=str(model_cfg.get("score_backbone", "unet")),
-                use_ema=bool(model_cfg.get("use_ema", True)),
-                ema_decay=float(model_cfg.get("ema_decay", 0.999)),
             )
-
-        return DSMRawInterface(
-            in_channels=int(cfg.data.in_channels),
-            image_size=int(cfg.data.params.image_size),
-            min_sigma=float(model_cfg.get("min_sigma", 0.01)),
-            max_sigma=float(model_cfg.get("max_sigma", 0.2)),
-            num_sigmas=int(model_cfg.get("num_sigmas", 4)),
-            base_channels=int(model_cfg.get("base_channels", 64)),
-            image_key=image_key,
-            learning_rate=float(trainer_optim["learning_rate"]),
-            anneal_power=float(model_cfg.get("anneal_power", 2.0)),
-            use_annealed_loss=bool(model_cfg.get("use_annealed_loss", True)),
-            val_logging=trainer_val_logging,
-            score_backbone=str(model_cfg.get("score_backbone", "unet")),
-            use_ema=bool(model_cfg.get("use_ema", True)),
-            ema_decay=float(model_cfg.get("ema_decay", 0.999)),
-        )
+        else:
+            dsm_kw.update(
+                in_channels=int(cfg.data.in_channels),
+                image_size=int(cfg.data.params.image_size),
+                vq_ckpt_path=None,
+                ddconfig=None,
+                n_embed=None,
+                embed_dim=None,
+            )
+        return DSMInterface(**dsm_kw)
 
     if model_name in ("ddpm", "ddpm_latent", "ddpm_raw"):
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
@@ -293,6 +323,31 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
         ddpm_cond = _ddpm_conditioning_kwargs(model_cfg)
 
         want_latent = _ddpm_wants_latent(model_name, model_cfg)
+        ddpm_kw: dict[str, Any] = {
+            "image_key": image_key,
+            "learning_rate": float(trainer_optim["learning_rate"]),
+            "timesteps": int(model_cfg.get("timesteps", 1000)),
+            "beta_schedule": str(model_cfg.get("beta_schedule", "linear")),
+            "linear_start": float(model_cfg.get("linear_start", 1e-4)),
+            "linear_end": float(model_cfg.get("linear_end", 2e-2)),
+            "cosine_s": float(model_cfg.get("cosine_s", 8e-3)),
+            "parameterization": str(model_cfg.get("parameterization", "eps")),
+            "loss_type": str(model_cfg.get("loss_type", "l2")),
+            "l_simple_weight": float(model_cfg.get("l_simple_weight", 1.0)),
+            "original_elbo_weight": float(
+                model_cfg.get("original_elbo_weight", 0.0)
+            ),
+            "base_channels": int(model_cfg.get("base_channels", 64)),
+            "num_res_blocks": int(model_cfg.get("num_res_blocks", 2)),
+            "attention_resolutions": att_res,
+            "channel_mult": ch_mult,
+            "dropout": float(model_cfg.get("dropout", 0.0)),
+            "use_ema": bool(model_cfg.get("use_ema", False)),
+            "ema_decay": float(model_cfg.get("ema_decay", 0.999)),
+            "val_logging": trainer_val_logging,
+            "sampling_cfg": model_cfg.get("sampling"),
+            **ddpm_cond,
+        }
         if want_latent:
             if not _vq_path_configured(model_cfg):
                 raise ValueError(
@@ -311,61 +366,24 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
                 raise ValueError(
                     f"{model_name}.embed_dim does not match VQ-VAE config embed_dim"
                 )
-            return DDPMLatentInterface(
+            ddpm_kw.update(
                 ddconfig=vq_ddconfig,
                 n_embed=vq_n_embed,
                 embed_dim=vq_embed_dim,
                 vq_ckpt_path=vq_ckpt,
-                image_key=image_key,
-                learning_rate=float(trainer_optim["learning_rate"]),
-                timesteps=int(model_cfg.get("timesteps", 1000)),
-                beta_schedule=str(model_cfg.get("beta_schedule", "linear")),
-                linear_start=float(model_cfg.get("linear_start", 1e-4)),
-                linear_end=float(model_cfg.get("linear_end", 2e-2)),
-                cosine_s=float(model_cfg.get("cosine_s", 8e-3)),
-                parameterization=str(model_cfg.get("parameterization", "eps")),
-                loss_type=str(model_cfg.get("loss_type", "l2")),
-                l_simple_weight=float(model_cfg.get("l_simple_weight", 1.0)),
-                original_elbo_weight=float(model_cfg.get("original_elbo_weight", 0.0)),
-                base_channels=int(model_cfg.get("base_channels", 64)),
-                num_res_blocks=int(model_cfg.get("num_res_blocks", 2)),
-                attention_resolutions=att_res,
-                channel_mult=ch_mult,
-                dropout=float(model_cfg.get("dropout", 0.0)),
                 logit_transform=bool(model_cfg.get("logit_transform", True)),
-                use_ema=bool(model_cfg.get("use_ema", False)),
-                ema_decay=float(model_cfg.get("ema_decay", 0.999)),
-                val_logging=trainer_val_logging,
-                sampling_cfg=model_cfg.get("sampling"),
-                **ddpm_cond,
             )
-
-        return DDPMRawInterface(
-            in_channels=int(cfg.data.in_channels),
-            image_size=int(cfg.data.params.image_size),
-            image_key=image_key,
-            learning_rate=float(trainer_optim["learning_rate"]),
-            timesteps=int(model_cfg.get("timesteps", 1000)),
-            beta_schedule=str(model_cfg.get("beta_schedule", "linear")),
-            linear_start=float(model_cfg.get("linear_start", 1e-4)),
-            linear_end=float(model_cfg.get("linear_end", 2e-2)),
-            cosine_s=float(model_cfg.get("cosine_s", 8e-3)),
-            parameterization=str(model_cfg.get("parameterization", "eps")),
-            loss_type=str(model_cfg.get("loss_type", "l2")),
-            l_simple_weight=float(model_cfg.get("l_simple_weight", 1.0)),
-            original_elbo_weight=float(model_cfg.get("original_elbo_weight", 0.0)),
-            base_channels=int(model_cfg.get("base_channels", 64)),
-            num_res_blocks=int(model_cfg.get("num_res_blocks", 2)),
-            attention_resolutions=att_res,
-            channel_mult=ch_mult,
-            dropout=float(model_cfg.get("dropout", 0.0)),
-            logit_transform=bool(model_cfg.get("logit_transform", False)),
-            use_ema=bool(model_cfg.get("use_ema", False)),
-            ema_decay=float(model_cfg.get("ema_decay", 0.999)),
-            val_logging=trainer_val_logging,
-            sampling_cfg=model_cfg.get("sampling"),
-            **ddpm_cond,
-        )
+        else:
+            ddpm_kw.update(
+                in_channels=int(cfg.data.in_channels),
+                image_size=int(cfg.data.params.image_size),
+                vq_ckpt_path=None,
+                ddconfig=None,
+                n_embed=None,
+                embed_dim=None,
+                logit_transform=bool(model_cfg.get("logit_transform", False)),
+            )
+        return DDPMInterface(**ddpm_kw)
 
     if model_name in ("score_sde", "score_sde_latent", "score_sde_raw"):
         trainer_optim = OmegaConf.to_container(cfg.trainer.optim, resolve=True)
@@ -373,6 +391,27 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             cfg.trainer.val_logging, resolve=True
         )
         want_latent = _score_sde_wants_latent(model_name, model_cfg)
+        score_kw: dict[str, Any] = {
+            "image_key": image_key,
+            "learning_rate": float(trainer_optim["learning_rate"]),
+            "sde_type": str(model_cfg.get("sde_type", "vesde")),
+            "sde_n": int(model_cfg.get("sde_n", 1000)),
+            "sigma_min": float(model_cfg.get("sigma_min", 0.01)),
+            "sigma_max": float(model_cfg.get("sigma_max", 50.0)),
+            "beta_min": float(model_cfg.get("beta_min", 0.1)),
+            "beta_max": float(model_cfg.get("beta_max", 20.0)),
+            "continuous": bool(model_cfg.get("continuous", True)),
+            "t_eps": float(model_cfg.get("t_eps", 1e-3)),
+            "likelihood_weighting": bool(
+                model_cfg.get("likelihood_weighting", True)
+            ),
+            "base_channels": int(model_cfg.get("base_channels", 64)),
+            "logit_transform": bool(model_cfg.get("logit_transform", False)),
+            "use_ema": bool(model_cfg.get("use_ema", False)),
+            "ema_decay": float(model_cfg.get("ema_decay", 0.999)),
+            "val_logging": trainer_val_logging,
+            "sampling_cfg": model_cfg.get("sampling"),
+        }
         if want_latent:
             if not _vq_path_configured(model_cfg):
                 raise ValueError(
@@ -383,51 +422,30 @@ def _build_module(cfg: DictConfig) -> pl.LightningModule:
             vq_ddconfig, vq_n_embed, vq_embed_dim = load_vqvae_meta_from_ckpt_path(
                 vq_ckpt
             )
-            return ScoreSDEInterface(
+            if "n_embed" in model_cfg and int(model_cfg["n_embed"]) != vq_n_embed:
+                raise ValueError(
+                    f"{model_name}.n_embed does not match VQ-VAE config n_embed"
+                )
+            if "embed_dim" in model_cfg and int(model_cfg["embed_dim"]) != vq_embed_dim:
+                raise ValueError(
+                    f"{model_name}.embed_dim does not match VQ-VAE config embed_dim"
+                )
+            score_kw.update(
                 ddconfig=vq_ddconfig,
                 n_embed=vq_n_embed,
                 embed_dim=vq_embed_dim,
                 vq_ckpt_path=vq_ckpt,
-                image_key=image_key,
-                learning_rate=float(trainer_optim["learning_rate"]),
-                sde_type=str(model_cfg.get("sde_type", "vesde")),
-                sde_n=int(model_cfg.get("sde_n", 1000)),
-                sigma_min=float(model_cfg.get("sigma_min", 0.01)),
-                sigma_max=float(model_cfg.get("sigma_max", 50.0)),
-                beta_min=float(model_cfg.get("beta_min", 0.1)),
-                beta_max=float(model_cfg.get("beta_max", 20.0)),
-                continuous=bool(model_cfg.get("continuous", True)),
-                t_eps=float(model_cfg.get("t_eps", 1e-3)),
-                likelihood_weighting=bool(model_cfg.get("likelihood_weighting", True)),
-                base_channels=int(model_cfg.get("base_channels", 64)),
-                logit_transform=bool(model_cfg.get("logit_transform", False)),
-                use_ema=bool(model_cfg.get("use_ema", False)),
-                ema_decay=float(model_cfg.get("ema_decay", 0.999)),
-                val_logging=trainer_val_logging,
-                sampling_cfg=model_cfg.get("sampling"),
             )
-
-        return ScoreSDERawInterface(
-            in_channels=int(cfg.data.in_channels),
-            image_size=int(cfg.data.params.image_size),
-            image_key=image_key,
-            learning_rate=float(trainer_optim["learning_rate"]),
-            sde_type=str(model_cfg.get("sde_type", "vesde")),
-            sde_n=int(model_cfg.get("sde_n", 1000)),
-            sigma_min=float(model_cfg.get("sigma_min", 0.01)),
-            sigma_max=float(model_cfg.get("sigma_max", 50.0)),
-            beta_min=float(model_cfg.get("beta_min", 0.1)),
-            beta_max=float(model_cfg.get("beta_max", 20.0)),
-            continuous=bool(model_cfg.get("continuous", True)),
-            t_eps=float(model_cfg.get("t_eps", 1e-3)),
-            likelihood_weighting=bool(model_cfg.get("likelihood_weighting", True)),
-            base_channels=int(model_cfg.get("base_channels", 64)),
-            logit_transform=bool(model_cfg.get("logit_transform", False)),
-            use_ema=bool(model_cfg.get("use_ema", False)),
-            ema_decay=float(model_cfg.get("ema_decay", 0.999)),
-            val_logging=trainer_val_logging,
-            sampling_cfg=model_cfg.get("sampling"),
-        )
+        else:
+            score_kw.update(
+                in_channels=int(cfg.data.in_channels),
+                image_size=int(cfg.data.params.image_size),
+                vq_ckpt_path=None,
+                ddconfig=None,
+                n_embed=None,
+                embed_dim=None,
+            )
+        return ScoreSDEBase(**score_kw)
 
     raise ValueError(f"Unknown model name: {model_name}")
 
@@ -493,6 +511,19 @@ def _save_checkpoint_dir_config(cfg: DictConfig, ckpt_dir: str) -> None:
         f.write(OmegaConf.to_yaml(cfg, resolve=True))
 
 
+def _wandb_project_checkpoint_segment(project: str) -> str:
+    """Filesystem-safe directory name from W&B project under checkpoints/."""
+    s = str(project).strip()
+    if not s:
+        return "unnamed_project"
+    s = s.replace(os.sep, "_")
+    if os.altsep:
+        s = s.replace(os.altsep, "_")
+    for c in '<>:"|?*':
+        s = s.replace(c, "_")
+    return s or "unnamed_project"
+
+
 def _resolve_vqvae_checkpoint_monitor(cfg: DictConfig) -> tuple[str, str]:
     """Return (monitor_key, filename_metric_token) for VQ-VAE checkpointing."""
     raw = str(
@@ -520,7 +551,7 @@ def main(cfg: DictConfig) -> None:
     _apply_hardware_options(cfg, trainer_kwargs)
 
     logger = False
-    checkpoint_subdir = "no_wandb"
+    checkpoint_relpath = "no_wandb"
     if cfg.wandb.enabled:
         logger = WandbLogger(
             project=cfg.wandb.project,
@@ -529,7 +560,9 @@ def main(cfg: DictConfig) -> None:
             save_dir=cfg.wandb.save_dir,
             log_model=cfg.wandb.log_model,
         )
-        checkpoint_subdir = logger.experiment.id
+        run_id = logger.experiment.id
+        project_seg = _wandb_project_checkpoint_segment(str(cfg.wandb.project))
+        checkpoint_relpath = os.path.join(project_seg, run_id)
         # Keep a readable run snapshot in W&B.
         logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
 
@@ -559,7 +592,7 @@ def main(cfg: DictConfig) -> None:
         ckpt_auto_insert_metric_name = False
     callbacks = [
         ModelCheckpoint(
-            dirpath=os.path.join("checkpoints", checkpoint_subdir),
+            dirpath=os.path.join("checkpoints", checkpoint_relpath),
             monitor=monitor,
             mode=mode,
             save_top_k=2,
@@ -571,7 +604,7 @@ def main(cfg: DictConfig) -> None:
     if cfg.wandb.enabled:
         callbacks.append(LearningRateMonitor(logging_interval="step"))
 
-    ckpt_dir = os.path.join("checkpoints", checkpoint_subdir)
+    ckpt_dir = os.path.join("checkpoints", checkpoint_relpath)
     _save_checkpoint_dir_config(cfg, ckpt_dir)
 
     trainer = pl.Trainer(logger=logger, callbacks=callbacks, **trainer_kwargs)

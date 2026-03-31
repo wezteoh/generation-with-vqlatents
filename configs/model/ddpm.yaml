@@ -27,4 +27,5 @@ logit_transform: false
 use_ema: false
 ema_decay: 0.999
 
+# See configs/model/ddpm_raw.yaml for `sampling` (method, dpmsolver_*, clip, guidance).
 sampling: null

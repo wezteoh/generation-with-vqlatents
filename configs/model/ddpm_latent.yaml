@@ -30,6 +30,7 @@ logit_transform: true
 use_ema: true
 ema_decay: 0.999
 
-# See configs/model/ddpm_raw.yaml for `conditioning` and `sampling` examples (same keys).
+# See configs/model/ddpm_raw.yaml for `conditioning` and `sampling` (same keys).
+# Context encoder output spatial size must match the VQ latent grid (not full image size).
 
 sampling: null

@@ -8,11 +8,19 @@ import torch.nn.functional as F
 from einops import rearrange
 from pytorch_lightning.loggers import WandbLogger
 
+from src.utils.latent_first_stage_ckpt import (
+    check_strict_first_stage_load,
+    omit_first_stage_keys,
+)
 from src.utils.sample_fid import run_sample_fid_if_gated
 from src.interfaces.transformer_latent import _load_vq_from_ckpt
+from src.modules.context_encoder import build_context_encoder, set_encoder_trainable
 from src.modules.ema import LitEma
 from src.modules.latents.ddpm import OpenAIUNetDDPM
-from src.utils.wandb_comparison import build_side_by_side_wandb_images
+from src.utils.wandb_comparison import (
+    build_side_by_side_wandb_images,
+    build_triplet_wandb_images,
+)
 
 ConditioningMode = Literal["none", "class", "context"]
 
@@ -49,6 +57,10 @@ class DDPMInterface(pl.LightningModule):
         context_key: str = "context",
         unconditional_prob: float = 0.0,
         context_dim: Optional[int] = None,
+        context_apply: str = "cross_attention",
+        cond_channels: Optional[int] = None,
+        context_encoder_cfg: Optional[dict[str, Any]] = None,
+        encoder_trainable: bool = True,
         transformer_depth: int = 1,
         vq_ckpt_path: Optional[str] = None,
         ddconfig: Optional[dict[str, Any]] = None,
@@ -99,6 +111,9 @@ class DDPMInterface(pl.LightningModule):
         self.label_key = str(label_key)
         self.context_key = str(context_key)
         self.unconditional_prob = float(unconditional_prob)
+        self.context_apply = str(context_apply)
+        self.encoder_trainable = bool(encoder_trainable)
+        self._cached_enc_uncond: Optional[torch.Tensor] = None
 
         self._val_pass_count = 0
         self.val_logging_cfg = val_logging or {
@@ -110,6 +125,7 @@ class DDPMInterface(pl.LightningModule):
         default_sampling_cfg: dict[str, Any] = {
             "clip_denoised": False,
             "guidance_scale": 1.0,
+            "method": "ancestral_sampling",
         }
         self.sampling_cfg = default_sampling_cfg
         if sampling_cfg is not None:
@@ -144,13 +160,36 @@ class DDPMInterface(pl.LightningModule):
                 )
             model_kw["num_data_classes"] = int(num_data_classes)
         elif conditioning_mode == "context":
-            if context_dim is None:
+            model_kw["context_apply"] = self.context_apply
+            if self.context_apply == "cross_attention":
+                if context_dim is None:
+                    raise ValueError(
+                        "context_dim is required when conditioning_mode is 'context' "
+                        "and context_apply is 'cross_attention'"
+                    )
+                model_kw["context_dim"] = int(context_dim)
+                model_kw["cond_channels"] = None
+            elif self.context_apply == "concat":
+                if cond_channels is None:
+                    raise ValueError(
+                        "cond_channels is required when conditioning_mode is 'context' "
+                        "and context_apply is 'concat'"
+                    )
+                model_kw["cond_channels"] = int(cond_channels)
+                model_kw["context_dim"] = None
+            else:
                 raise ValueError(
-                    "context_dim is required when conditioning_mode is 'context'"
+                    f"context_apply must be 'cross_attention' or 'concat', "
+                    f"got {self.context_apply!r}"
                 )
-            model_kw["context_dim"] = int(context_dim)
 
         self.model = OpenAIUNetDDPM(**model_kw)
+
+        if conditioning_mode == "context":
+            self.context_encoder = build_context_encoder(context_encoder_cfg)
+            set_encoder_trainable(self.context_encoder, self.encoder_trainable)
+        else:
+            self.context_encoder = None
 
         if bool(use_ema):
             if not (0.0 < float(ema_decay) <= 1.0):
@@ -163,14 +202,143 @@ class DDPMInterface(pl.LightningModule):
     def use_first_stage(self) -> bool:
         return self.model.first_stage_model is not None
 
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        o = super().state_dict(*args, **kwargs)
+        if self.use_first_stage:
+            return omit_first_stage_keys(o)
+        return o
+
+    def load_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        strict: bool = True,
+        assign: bool = False,
+    ) -> Any:
+        if not self.use_first_stage:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        filtered = omit_first_stage_keys(state_dict)
+        incomp = super().load_state_dict(filtered, strict=False, assign=assign)
+        if strict:
+            check_strict_first_stage_load(incomp)
+        return incomp
+
+    def on_train_epoch_start(self) -> None:
+        if self.conditioning_mode == "context" and self.encoder_trainable:
+            self._cached_enc_uncond = None
+
+    def _get_raw_unconditional(self, ref_bchw: torch.Tensor) -> torch.Tensor:
+        dm = (
+            getattr(self.trainer, "datamodule", None)
+            if self.trainer is not None
+            else None
+        )
+        if dm is not None:
+            try:
+                return dm.unconditional_context
+            except NotImplementedError:
+                pass
+        return torch.zeros(
+            1,
+            ref_bchw.shape[1],
+            ref_bchw.shape[2],
+            ref_bchw.shape[3],
+            device=ref_bchw.device,
+            dtype=ref_bchw.dtype,
+        )
+
+    def _ensure_uncond_encoded_cache(
+        self, enc_sample: torch.Tensor, ref_raw: torch.Tensor
+    ) -> None:
+        if self.encoder_trainable or self._cached_enc_uncond is not None:
+            return
+        raw_u = self._get_raw_unconditional(ref_raw).to(
+            ref_raw.device, dtype=ref_raw.dtype
+        )
+        with torch.no_grad():
+            enc_u = self.context_encoder(raw_u)
+        if enc_u.shape[1:] != enc_sample.shape[1:]:
+            raise ValueError(
+                f"Unconditional encoded shape {tuple(enc_u.shape)} != "
+                f"conditional {tuple(enc_sample.shape)}"
+            )
+        self._cached_enc_uncond = enc_u.detach()
+
+    def _encoded_to_model_inputs(
+        self, enc: torch.Tensor
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        h = w = self.model.image_size
+        if enc.shape[-2] != h or enc.shape[-1] != w:
+            raise ValueError(
+                f"Context encoder spatial {tuple(enc.shape[-2:])} must match "
+                f"UNet ({h}, {w})"
+            )
+        if self.model.context_apply == "cross_attention":
+            cd = self.model.context_dim
+            assert cd is not None
+            if enc.shape[1] != cd:
+                raise ValueError(
+                    f"Encoded context channels {enc.shape[1]} != context_dim {cd}"
+                )
+            return rearrange(enc, "b c hh ww -> b (hh ww) c"), None
+        cc = self.model.cond_channels
+        assert cc is not None
+        if enc.shape[1] != cc:
+            raise ValueError(
+                f"Encoded context channels {enc.shape[1]} != cond_channels {cc}"
+            )
+        return None, enc
+
+    def _unconditional_encoded_batched(
+        self, batch_size: int, enc_cond: torch.Tensor, ref_raw: torch.Tensor
+    ) -> torch.Tensor:
+        self._ensure_uncond_encoded_cache(enc_cond, ref_raw)
+        if self._cached_enc_uncond is None:
+            raw_u = self._get_raw_unconditional(ref_raw).to(
+                ref_raw.device, dtype=ref_raw.dtype
+            )
+            enc_u = self.context_encoder(raw_u)
+            return enc_u.expand(batch_size, -1, -1, -1)
+        return self._cached_enc_uncond.expand(batch_size, -1, -1, -1).to(
+            enc_cond.device, dtype=enc_cond.dtype
+        )
+
+    def _sample_latents_kwargs_from_sampling_cfg(self) -> dict[str, Any]:
+        """Map ``sampling_cfg`` to ``OpenAIUNetDDPM.sample_latents`` keyword args."""
+        sc = self.sampling_cfg
+        method = str(sc.get("method", "ancestral_sampling"))
+        out: dict[str, Any] = {"method": method}
+        if method in ("dpmsolver", "dpm_solver"):
+            out["dpmsolver_steps"] = int(sc.get("dpmsolver_steps", 20))
+            out["dpmsolver_order"] = int(sc.get("dpmsolver_order", 3))
+            out["dpmsolver_inner_method"] = str(
+                sc.get("dpmsolver_inner_method", "singlestep")
+            )
+            out["dpmsolver_skip_type"] = str(
+                sc.get("dpmsolver_skip_type", "time_uniform")
+            )
+            out["dpmsolver_algorithm_type"] = str(
+                sc.get("dpmsolver_algorithm_type", "dpmsolver++")
+            )
+            out["dpmsolver_denoise_to_zero"] = bool(
+                sc.get("dpmsolver_denoise_to_zero", False)
+            )
+        return out
+
     def forward(
         self,
         x: torch.Tensor,
         timesteps: torch.Tensor,
         y: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
+        cond_spatial: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.model(x, timesteps=timesteps, y=y, context=context)
+        return self.model(
+            x,
+            timesteps=timesteps,
+            y=y,
+            context=context,
+            cond_spatial=cond_spatial,
+        )
 
     def _get_loss(
         self, pred: torch.Tensor, target: torch.Tensor, mean: bool = True
@@ -197,9 +365,12 @@ class DDPMInterface(pl.LightningModule):
         stage: str,
         y: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
+        cond_spatial: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x_noisy = self.model.q_sample(x_start, t, noise)
-        model_out = self.model(x_noisy, t, y=y, context=context)
+        model_out = self.model(
+            x_noisy, t, y=y, context=context, cond_spatial=cond_spatial
+        )
 
         if self.parameterization == "eps":
             target = noise
@@ -279,19 +450,37 @@ class DDPMInterface(pl.LightningModule):
                     torch.full_like(y, self.model.null_class_index),
                     y,
                 )
-            return self._p_losses(x0, t, noise, stage=stage, y=y, context=None)
+            return self._p_losses(
+                x0, t, noise, stage=stage, y=y, context=None, cond_spatial=None
+            )
 
         if self.context_key not in batch:
             raise KeyError(
                 f"Batch missing context key {self.context_key!r} (context conditioning)"
             )
+        assert self.context_encoder is not None
         ctx_map = batch[self.context_key].to(device)
-        context = rearrange(ctx_map, "b c h w -> b (h w) c")
+        enc_c = self.context_encoder(ctx_map)
+        context, cond_spatial = self._encoded_to_model_inputs(enc_c)
         if stage == "train" and self.unconditional_prob > 0.0:
             mask = torch.rand(b, device=device) < self.unconditional_prob
-            zero = torch.zeros_like(context)
-            context = torch.where(mask.view(b, 1, 1), zero, context)
-        return self._p_losses(x0, t, noise, stage=stage, y=None, context=context)
+            enc_u = self._unconditional_encoded_batched(b, enc_c, ctx_map)
+            ctx_u, sp_u = self._encoded_to_model_inputs(enc_u)
+            if self.model.context_apply == "cross_attention":
+                assert context is not None and ctx_u is not None
+                context = torch.where(mask.view(b, 1, 1), ctx_u, context)
+            else:
+                assert cond_spatial is not None and sp_u is not None
+                cond_spatial = torch.where(mask.view(b, 1, 1, 1), sp_u, cond_spatial)
+        return self._p_losses(
+            x0,
+            t,
+            noise,
+            stage=stage,
+            y=None,
+            context=context,
+            cond_spatial=cond_spatial,
+        )
 
     def training_step(
         self, batch: dict[str, torch.Tensor], batch_idx: int
@@ -338,6 +527,7 @@ class DDPMInterface(pl.LightningModule):
                 y=None,
                 context=None,
                 guidance_scale=1.0,
+                **self._sample_latents_kwargs_from_sampling_cfg(),
             )
             if self.use_first_stage:
                 return self.model.quantize_and_decode(lat)
@@ -418,6 +608,7 @@ class DDPMInterface(pl.LightningModule):
                 y=None,
                 context=None,
                 guidance_scale=1.0,
+                **self._sample_latents_kwargs_from_sampling_cfg(),
             )
             if self.use_first_stage:
                 gen_tensor = self.model.quantize_and_decode(sampled)
@@ -443,6 +634,7 @@ class DDPMInterface(pl.LightningModule):
                 y=y,
                 context=None,
                 guidance_scale=g_scale,
+                **self._sample_latents_kwargs_from_sampling_cfg(),
             )
             if self.use_first_stage:
                 gen_tensor = self.model.quantize_and_decode(sampled)
@@ -454,177 +646,58 @@ class DDPMInterface(pl.LightningModule):
                 x_img, gen_tensor, captions=captions
             )
         else:
+            assert self.context_encoder is not None
             ctx_map = batch[self.context_key][:n].to(device)
-            context = rearrange(ctx_map, "b c h w -> b (h w) c")
-            sampled = self.model.sample_latents(
-                batch_size=n,
-                latent_shape=latent_shape,
-                device=device,
-                clip_denoised=clip,
-                y=None,
-                context=context,
-                guidance_scale=g_scale,
-            )
+            enc_c = self.context_encoder(ctx_map)
+            ctx_c, sp_c = self._encoded_to_model_inputs(enc_c)
+            ctx_u: Optional[torch.Tensor] = None
+            sp_u: Optional[torch.Tensor] = None
+            if g_scale != 1.0:
+                enc_u = self._unconditional_encoded_batched(n, enc_c, ctx_map)
+                ctx_u, sp_u = self._encoded_to_model_inputs(enc_u)
+            if self.model.context_apply == "cross_attention":
+                sampled = self.model.sample_latents(
+                    batch_size=n,
+                    latent_shape=latent_shape,
+                    device=device,
+                    clip_denoised=clip,
+                    y=None,
+                    context=ctx_c,
+                    context_uncond=ctx_u,
+                    cond_spatial=None,
+                    cond_spatial_uncond=None,
+                    guidance_scale=g_scale,
+                    **self._sample_latents_kwargs_from_sampling_cfg(),
+                )
+            else:
+                sampled = self.model.sample_latents(
+                    batch_size=n,
+                    latent_shape=latent_shape,
+                    device=device,
+                    clip_denoised=clip,
+                    y=None,
+                    context=None,
+                    context_uncond=None,
+                    cond_spatial=sp_c,
+                    cond_spatial_uncond=sp_u,
+                    guidance_scale=g_scale,
+                    **self._sample_latents_kwargs_from_sampling_cfg(),
+                )
             if self.use_first_stage:
                 gen_tensor = self.model.quantize_and_decode(sampled)
             else:
                 gen_tensor = sampled
-            captions = [f"real | gen (context) [{i}]" for i in range(n)]
-            images = build_side_by_side_wandb_images(
-                x_img, gen_tensor, captions=captions
-            )
+            cm = ctx_map
+            if cm.dim() == 4 and cm.shape[1] in (1, 3):
+                cap = [f"real | cond | gen [{i}]" for i in range(n)]
+                images = build_triplet_wandb_images(x_img, cm, gen_tensor, captions=cap)
+            else:
+                cap = [f"real | gen (context) [{i}]" for i in range(n)]
+                images = build_side_by_side_wandb_images(
+                    x_img, gen_tensor, captions=cap
+                )
 
         self.logger.experiment.log(
             {log_key: images},
             step=self.global_step,
-        )
-
-
-class DDPMRawInterface(DDPMInterface):
-    """Raw-pixel DDPM; thin wrapper for `load_from_checkpoint` compatibility."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        image_size: int,
-        image_key: str = "image",
-        learning_rate: float = 1e-4,
-        timesteps: int = 1000,
-        beta_schedule: str = "linear",
-        linear_start: float = 1e-4,
-        linear_end: float = 2e-2,
-        cosine_s: float = 8e-3,
-        parameterization: str = "eps",
-        loss_type: str = "l2",
-        l_simple_weight: float = 1.0,
-        original_elbo_weight: float = 0.0,
-        base_channels: int = 64,
-        num_res_blocks: int = 2,
-        attention_resolutions: Optional[tuple[int, ...]] = None,
-        channel_mult: tuple[int, ...] = (1, 2, 4, 8),
-        dropout: float = 0.0,
-        logit_transform: bool = False,
-        use_ema: bool = False,
-        ema_decay: float = 0.999,
-        val_logging: Optional[dict[str, Any]] = None,
-        sampling_cfg: Optional[dict[str, Any]] = None,
-        conditioning_mode: ConditioningMode = "none",
-        num_data_classes: Optional[int] = None,
-        label_key: str = "label",
-        context_key: str = "context",
-        unconditional_prob: float = 0.0,
-        context_dim: Optional[int] = None,
-        transformer_depth: int = 1,
-    ) -> None:
-        super().__init__(
-            image_key=image_key,
-            learning_rate=learning_rate,
-            timesteps=timesteps,
-            beta_schedule=beta_schedule,
-            linear_start=linear_start,
-            linear_end=linear_end,
-            cosine_s=cosine_s,
-            parameterization=parameterization,
-            loss_type=loss_type,
-            l_simple_weight=l_simple_weight,
-            original_elbo_weight=original_elbo_weight,
-            base_channels=base_channels,
-            num_res_blocks=num_res_blocks,
-            attention_resolutions=attention_resolutions,
-            channel_mult=channel_mult,
-            dropout=dropout,
-            logit_transform=logit_transform,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
-            val_logging=val_logging,
-            sampling_cfg=sampling_cfg,
-            conditioning_mode=conditioning_mode,
-            num_data_classes=num_data_classes,
-            label_key=label_key,
-            context_key=context_key,
-            unconditional_prob=unconditional_prob,
-            context_dim=context_dim,
-            transformer_depth=transformer_depth,
-            vq_ckpt_path=None,
-            ddconfig=None,
-            n_embed=None,
-            embed_dim=None,
-            in_channels=in_channels,
-            image_size=image_size,
-        )
-
-
-class DDPMLatentInterface(DDPMInterface):
-    """Latent DDPM; thin wrapper for `load_from_checkpoint` compatibility."""
-
-    def __init__(
-        self,
-        ddconfig: dict[str, Any],
-        n_embed: int,
-        embed_dim: int,
-        vq_ckpt_path: str,
-        image_key: str = "image",
-        learning_rate: float = 1e-4,
-        timesteps: int = 1000,
-        beta_schedule: str = "linear",
-        linear_start: float = 1e-4,
-        linear_end: float = 2e-2,
-        cosine_s: float = 8e-3,
-        parameterization: str = "eps",
-        loss_type: str = "l2",
-        l_simple_weight: float = 1.0,
-        original_elbo_weight: float = 0.0,
-        base_channels: int = 64,
-        num_res_blocks: int = 2,
-        attention_resolutions: Optional[tuple[int, ...]] = None,
-        channel_mult: tuple[int, ...] = (1, 2, 4, 8),
-        dropout: float = 0.0,
-        logit_transform: bool = True,
-        use_ema: bool = False,
-        ema_decay: float = 0.999,
-        val_logging: Optional[dict[str, Any]] = None,
-        sampling_cfg: Optional[dict[str, Any]] = None,
-        conditioning_mode: ConditioningMode = "none",
-        num_data_classes: Optional[int] = None,
-        label_key: str = "label",
-        context_key: str = "context",
-        unconditional_prob: float = 0.0,
-        context_dim: Optional[int] = None,
-        transformer_depth: int = 1,
-    ) -> None:
-        super().__init__(
-            image_key=image_key,
-            learning_rate=learning_rate,
-            timesteps=timesteps,
-            beta_schedule=beta_schedule,
-            linear_start=linear_start,
-            linear_end=linear_end,
-            cosine_s=cosine_s,
-            parameterization=parameterization,
-            loss_type=loss_type,
-            l_simple_weight=l_simple_weight,
-            original_elbo_weight=original_elbo_weight,
-            base_channels=base_channels,
-            num_res_blocks=num_res_blocks,
-            attention_resolutions=attention_resolutions,
-            channel_mult=channel_mult,
-            dropout=dropout,
-            logit_transform=logit_transform,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
-            val_logging=val_logging,
-            sampling_cfg=sampling_cfg,
-            conditioning_mode=conditioning_mode,
-            num_data_classes=num_data_classes,
-            label_key=label_key,
-            context_key=context_key,
-            unconditional_prob=unconditional_prob,
-            context_dim=context_dim,
-            transformer_depth=transformer_depth,
-            vq_ckpt_path=vq_ckpt_path,
-            ddconfig=ddconfig,
-            n_embed=n_embed,
-            embed_dim=embed_dim,
-            in_channels=None,
-            image_size=None,
         )

@@ -7,6 +7,10 @@ import torch
 from pytorch_lightning.loggers import WandbLogger
 
 from src.interfaces.transformer_latent import _load_vq_from_ckpt
+from src.utils.latent_first_stage_ckpt import (
+    check_strict_first_stage_load,
+    omit_first_stage_keys,
+)
 from src.modules.ema import LitEma
 from src.modules.latents.score_sde.ncsnv2 import LatentNCSNv2ScoreSDE
 from src.modules.losses.score_sde import score_sde_loss
@@ -156,6 +160,26 @@ class ScoreSDEBase(pl.LightningModule):
     @property
     def use_first_stage(self) -> bool:
         return self.model.first_stage_model is not None
+
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        o = super().state_dict(*args, **kwargs)
+        if self.use_first_stage:
+            return omit_first_stage_keys(o)
+        return o
+
+    def load_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        strict: bool = True,
+        assign: bool = False,
+    ) -> Any:
+        if not self.use_first_stage:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        filtered = omit_first_stage_keys(state_dict)
+        incomp = super().load_state_dict(filtered, strict=False, assign=assign)
+        if strict:
+            check_strict_first_stage_load(incomp)
+        return incomp
 
     def forward(
         self,
@@ -329,110 +353,4 @@ class ScoreSDEBase(pl.LightningModule):
         self.logger.experiment.log(
             {"val/score_sde_samples": images},
             step=self.global_step,
-        )
-
-
-class ScoreSDEInterface(ScoreSDEBase):
-    """Latent Score-SDE (VQ first stage); thin wrapper for checkpoint compatibility."""
-
-    def __init__(
-        self,
-        ddconfig: dict[str, Any],
-        n_embed: int,
-        embed_dim: int,
-        vq_ckpt_path: str,
-        image_key: str = "image",
-        learning_rate: float = 1e-4,
-        sde_type: str = "vesde",
-        sde_n: int = 1000,
-        sigma_min: float = 0.01,
-        sigma_max: float = 50.0,
-        beta_min: float = 0.1,
-        beta_max: float = 20.0,
-        continuous: bool = True,
-        t_eps: float = 1e-3,
-        likelihood_weighting: bool = True,
-        base_channels: int = 64,
-        logit_transform: bool = False,
-        use_ema: bool = False,
-        ema_decay: float = 0.999,
-        val_logging: Optional[dict[str, Any]] = None,
-        sampling_cfg: Optional[dict[str, Any]] = None,
-    ) -> None:
-        super().__init__(
-            learning_rate=learning_rate,
-            sde_type=sde_type,
-            sde_n=sde_n,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max,
-            beta_min=beta_min,
-            beta_max=beta_max,
-            continuous=continuous,
-            t_eps=t_eps,
-            likelihood_weighting=likelihood_weighting,
-            base_channels=base_channels,
-            logit_transform=logit_transform,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
-            val_logging=val_logging,
-            sampling_cfg=sampling_cfg,
-            image_key=image_key,
-            vq_ckpt_path=vq_ckpt_path,
-            ddconfig=ddconfig,
-            n_embed=n_embed,
-            embed_dim=embed_dim,
-            in_channels=None,
-            image_size=None,
-        )
-
-
-class ScoreSDERawInterface(ScoreSDEBase):
-    """Raw Score-SDE; thin wrapper for checkpoint compatibility."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        image_size: int,
-        learning_rate: float = 1e-4,
-        sde_type: str = "vesde",
-        sde_n: int = 1000,
-        sigma_min: float = 0.01,
-        sigma_max: float = 50.0,
-        beta_min: float = 0.1,
-        beta_max: float = 20.0,
-        continuous: bool = True,
-        t_eps: float = 1e-3,
-        likelihood_weighting: bool = True,
-        base_channels: int = 64,
-        logit_transform: bool = False,
-        use_ema: bool = False,
-        ema_decay: float = 0.999,
-        val_logging: Optional[dict[str, Any]] = None,
-        sampling_cfg: Optional[dict[str, Any]] = None,
-        image_key: str = "image",
-    ) -> None:
-        super().__init__(
-            learning_rate=learning_rate,
-            sde_type=sde_type,
-            sde_n=sde_n,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max,
-            beta_min=beta_min,
-            beta_max=beta_max,
-            continuous=continuous,
-            t_eps=t_eps,
-            likelihood_weighting=likelihood_weighting,
-            base_channels=base_channels,
-            logit_transform=logit_transform,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
-            val_logging=val_logging,
-            sampling_cfg=sampling_cfg,
-            image_key=image_key,
-            vq_ckpt_path=None,
-            ddconfig=None,
-            n_embed=None,
-            embed_dim=None,
-            in_channels=in_channels,
-            image_size=image_size,
         )

@@ -6,6 +6,10 @@ import pytorch_lightning as pl
 import torch
 
 from src.interfaces.transformer_latent import _load_vq_from_ckpt
+from src.utils.latent_first_stage_ckpt import (
+    check_strict_first_stage_load,
+    omit_first_stage_keys,
+)
 from src.modules.ema import LitEma
 from src.modules.latents.score_models import ScoreModel
 from src.modules.latents.score_models.cond_refinednet import LatentCondRefineNetScore
@@ -137,6 +141,26 @@ class DSMInterface(pl.LightningModule):
     @property
     def use_first_stage(self) -> bool:
         return self.model.first_stage_model is not None
+
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        o = super().state_dict(*args, **kwargs)
+        if self.use_first_stage:
+            return omit_first_stage_keys(o)
+        return o
+
+    def load_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        strict: bool = True,
+        assign: bool = False,
+    ) -> Any:
+        if not self.use_first_stage:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        filtered = omit_first_stage_keys(state_dict)
+        incomp = super().load_state_dict(filtered, strict=False, assign=assign)
+        if strict:
+            check_strict_first_stage_load(incomp)
+        return incomp
 
     def forward(self, x: torch.Tensor, sigma_labels: torch.Tensor) -> torch.Tensor:
         return self.model(x, sigma_labels)
@@ -310,86 +334,4 @@ class DSMInterface(pl.LightningModule):
         self.logger.experiment.log(
             {"val/dsm_samples": images},
             step=self.global_step,
-        )
-
-
-class DSMRawInterface(DSMInterface):
-    def __init__(
-        self,
-        in_channels: int,
-        image_size: int,
-        min_sigma: float,
-        max_sigma: float,
-        num_sigmas: int,
-        base_channels: int = 64,
-        image_key: str = "image",
-        learning_rate: float = 2e-4,
-        anneal_power: float = 2.0,
-        use_annealed_loss: bool = True,
-        val_logging: Optional[dict[str, Any]] = None,
-        score_backbone: str = "unet",
-        use_ema: bool = False,
-        ema_decay: float = 0.999,
-    ) -> None:
-        super().__init__(
-            min_sigma=min_sigma,
-            max_sigma=max_sigma,
-            num_sigmas=num_sigmas,
-            base_channels=base_channels,
-            image_key=image_key,
-            learning_rate=learning_rate,
-            anneal_power=anneal_power,
-            use_annealed_loss=use_annealed_loss,
-            val_logging=val_logging,
-            score_backbone=score_backbone,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
-            vq_ckpt_path=None,
-            ddconfig=None,
-            n_embed=None,
-            embed_dim=None,
-            in_channels=in_channels,
-            image_size=image_size,
-        )
-
-
-class DSMLatentInterface(DSMInterface):
-    def __init__(
-        self,
-        ddconfig: dict[str, Any],
-        n_embed: int,
-        embed_dim: int,
-        vq_ckpt_path: str,
-        min_sigma: float,
-        max_sigma: float,
-        num_sigmas: int,
-        base_channels: int = 64,
-        image_key: str = "image",
-        learning_rate: float = 2e-4,
-        anneal_power: float = 2.0,
-        use_annealed_loss: bool = True,
-        val_logging: Optional[dict[str, Any]] = None,
-        score_backbone: str = "unet",
-        use_ema: bool = False,
-        ema_decay: float = 0.999,
-    ) -> None:
-        super().__init__(
-            min_sigma=min_sigma,
-            max_sigma=max_sigma,
-            num_sigmas=num_sigmas,
-            base_channels=base_channels,
-            image_key=image_key,
-            learning_rate=learning_rate,
-            anneal_power=anneal_power,
-            use_annealed_loss=use_annealed_loss,
-            val_logging=val_logging,
-            score_backbone=score_backbone,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
-            vq_ckpt_path=vq_ckpt_path,
-            ddconfig=ddconfig,
-            n_embed=n_embed,
-            embed_dim=embed_dim,
-            in_channels=None,
-            image_size=None,
         )
